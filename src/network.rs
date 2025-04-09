@@ -1,5 +1,5 @@
 use futures::prelude::*;
-use libp2p::{core::upgrade, gossipsub, gossipsub::{MessageAuthenticity, ValidationMode}, identify, identity, kad, kad::{store::MemoryStore}, mdns, noise, request_response, swarm::{NetworkBehaviour, SwarmEvent}, tcp, yamux, Multiaddr, PeerId, 
+use libp2p::{core::upgrade, gossipsub, gossipsub::{MessageAuthenticity, ValidationMode}, identify, identity, kad, kad::{store::MemoryStore}, mdns, noise, request_response, swarm::{NetworkBehaviour, SwarmEvent}, tcp, yamux, Multiaddr, PeerId,
              StreamProtocol, Swarm, Transport};
 use std::{
     collections::hash_map::DefaultHasher,
@@ -9,14 +9,43 @@ use std::{
     task::Poll,
     time::Duration,
 };
+use std::collections::HashSet;
 use futures::channel::mpsc::{Receiver, Sender};
+use futures::channel::{mpsc, oneshot};
+use libp2p::request_response::ResponseChannel;
 use libp2p::swarm::handler::ProtocolSupport;
+use libp2p::swarm::PeerAddresses;
 use libp2p::swarm::SwarmEvent::Behaviour;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-struct Command {
-
+enum Command {
+    StartListening {
+        addr: Multiaddr,
+        sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>
+    },
+    Dial {
+        peer_id: PeerId,
+        peer_addr: Multiaddr,
+        sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>
+    },
+    StartProviding {
+        file_name: String,
+        sender: oneshot::Sender<()>
+    },
+    GetProviders {
+        file_name: String,
+        sender: oneshot::Sender<HashSet<PeerId>>
+    },
+    RequestFile {
+        file_name: String,
+        peer: PeerId,
+        sender: oneshot::Sender<Result<Vec<u8>, Box<dyn Error + Send>>>
+    },
+    RespondFile {
+        file: Vec<u8>,
+        channel: ResponseChannel<FileResponse>
+    }
 }
 
 #[derive(Clone)]
@@ -101,12 +130,18 @@ enum Event {
 }
 
 struct EventLoop {
-
+    swarm: Swarm<MyBehaviour>,
+    command_receiver: Receiver<Command>,
+    event_sender: Sender<Event>,
 }
 
 impl EventLoop {
-    fn new(p0: Swarm<MyBehaviour>, p1: Receiver<Command>, p2: Sender<Event>) -> EventLoop {
-        todo!()
+    fn new(swarm: Swarm<MyBehaviour>, command_receiver: Receiver<Command>, event_sender: Sender<Event>) -> Self {
+        Self {
+            swarm,
+            command_receiver,
+            event_sender
+        }
     }
 }
 
