@@ -20,31 +20,9 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 enum Command {
-    StartListening {
-        addr: Multiaddr,
-        sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>
-    },
-    Dial {
-        peer_id: PeerId,
-        peer_addr: Multiaddr,
-        sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>
-    },
-    StartProviding {
-        file_name: String,
-        sender: oneshot::Sender<()>
-    },
-    GetProviders {
-        file_name: String,
-        sender: oneshot::Sender<HashSet<PeerId>>
-    },
-    RequestFile {
-        file_name: String,
-        peer: PeerId,
-        sender: oneshot::Sender<Result<Vec<u8>, Box<dyn Error + Send>>>
-    },
-    RespondFile {
-        file: Vec<u8>,
-        channel: ResponseChannel<FileResponse>
+    SendMessage {
+        message: String,
+        sender: oneshot::Sender<(), Box<dyn Error + Send>>
     }
 }
 
@@ -53,7 +31,19 @@ pub struct Client {
     sender: Sender<Command>,
 }
 
-async fn new(secret_key_seed: Option<u8>) -> Result<(Client, impl Stream<Item = Event>, EventLoop), Box<dyn Error>> {
+impl Client {
+    pub async fn send_message(&mut self, message: String) {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(Command::SendMessage {message, sender})
+            .await
+            .expect("Command receiver not to be dropped");
+        receiver.await.expect("Sender not to be dropped");
+
+    }
+}
+
+pub async fn new(secret_key_seed: Option<u8>) -> Result<(Client, impl Stream<Item = Event>, EventLoop), Box<dyn Error>> {
     let id_keys = match secret_key_seed {
         Some(seed) => {
             let mut bytes = [0u8; 32];
@@ -107,8 +97,8 @@ async fn new(secret_key_seed: Option<u8>) -> Result<(Client, impl Stream<Item = 
         .behaviour_mut()
         .kademlia
         .set_mode(Some(kad::Mode::Server));
-    let (command_sender, command_receiver) = futures::channel::mpsc::channel(0);
-    let (event_sender, event_receiver) = futures::channel::mpsc::channel(0);
+    let (command_sender, command_receiver) = mpsc::channel(0);
+    let (event_sender, event_receiver) = mpsc::channel(0);
 
     Ok((
         Client{
@@ -125,14 +115,18 @@ fn message_id_fn(message: &gossipsub::Message) -> gossipsub::MessageId {
     gossipsub::MessageId::from(s.finish().to_string())
 }
 
-enum Event {
-
+pub enum Event {
+    InboundRequest {
+        request: String,
+        channel: ResponseChannel<FileResponse>
+    }
 }
 
-struct EventLoop {
+pub struct EventLoop {
     swarm: Swarm<MyBehaviour>,
     command_receiver: Receiver<Command>,
     event_sender: Sender<Event>,
+    topic: gossipsub::IdentTopic
 }
 
 impl EventLoop {
@@ -140,7 +134,66 @@ impl EventLoop {
         Self {
             swarm,
             command_receiver,
-            event_sender
+            event_sender,
+            topic: gossipsub::IdentTopic::new("test-net"),
+        }
+    }
+
+    pub async fn run(mut self) {
+        self.swarm.behaviour_mut().gossipsub.subscribe(&self.topic).unwrap();
+        loop {
+            tokio::select! {
+                event = self.swarm.select_next_some() => self.handle_event(event).await,
+                command = self.command_receiver.next() => match command {
+                    Some(c) => self.handle_command(c).await,
+                    None => return
+                }
+            }
+        }
+    }
+
+    async fn handle_event(&mut self, event: SwarmEvent<MyBehaviourEvent>) {
+        match event {
+            Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+                for (peer_id, _multiaddr) in list {
+                    println!("mDNS discovered a new peer: {peer_id}");
+                    self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                }
+            },
+            Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
+                for (peer_id, _multiaddr) in list {
+                    println!("mDNS discover peer has expired: {peer_id}");
+                    self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                }
+            },
+            Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                propagation_source: peer_id,
+                message_id: id,
+                message})) =>  println!(
+                "Got message: '{}' with id: {id} from peer: {peer_id}",
+                String::from_utf8_lossy(&message.data)
+            ),
+            SwarmEvent::NewListenAddr {address, ..} => {
+                println!("Local node is listening on {address}")
+            }
+            _ => {}
+        }
+    }
+
+    async fn handle_command(&mut self, command: Command) {
+        match command {
+            Command::SendMessage {message, sender} => {
+                match self.swarm.behaviour_mut().gossipsub.publish(self.topic.clone(), message.as_bytes()) {
+                    Ok(_) => {
+                        println!("Sent message: {message}");
+                        sender.send(Ok(()));
+                    },
+                    Err(e) => {
+                        println!("Failed to send message: {e:?}");
+                        sender.send(Err(Box::new(e)));
+                    }
+                }
+            }
         }
     }
 }

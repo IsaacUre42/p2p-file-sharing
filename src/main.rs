@@ -1,5 +1,44 @@
+use std::io::{BufReader, Stdin};
+use tokio::io;
+use tokio::io::{AsyncBufReadExt, Lines};
+use tokio::spawn;
+use regex::Regex;
+
 mod network;
 
-fn main() {
-    println!("Hello, world!");
+#[tokio::main]
+async fn main() {
+    let (mut network_client, mut network_events, network_event_loop) =
+    network::new(None).await.unwrap();
+
+    spawn(network_event_loop.run());
+
+    let mut stdin = io::BufReader::new(io::stdin()).lines();
+
+    loop {
+        
+        let line = stdin.next_line().await.unwrap();
+        let args = split_string(&line.unwrap().as_str());
+        let cmd = if let Some(cmd) = args.get(0) { cmd } else {
+            println!("No command given");
+            return;
+        };
+        
+        match cmd.as_str() {
+            "msg" => {
+                if args.len() > 1 {
+                    let message = args.get(1).unwrap().to_string();
+                    network_client.send_message(message).await;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn split_string(input: &str) -> Vec<String> {
+    let re = Regex::new(r#""([^"]*)"|\S+"#).unwrap();
+    re.captures_iter(input)
+        .map(|cap| cap.get(0).unwrap().as_str().to_string())
+        .collect()
 }
