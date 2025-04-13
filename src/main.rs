@@ -8,7 +8,7 @@ mod network;
 
 #[tokio::main]
 async fn main() {
-    let (mut network_client, mut network_events, network_event_loop) =
+    let (mut client, mut network_events, network_event_loop) =
     network::new(None).await.unwrap();
 
     spawn(network_event_loop.run());
@@ -28,8 +28,23 @@ async fn main() {
             "msg" => {
                 if args.len() > 1 {
                     let message = args.get(1).unwrap().to_string();
-                    network_client.send_message(message).await;
+                    client.send_message(message).await;
                 }
+            },
+            "reg" => {
+                if args.len() > 1 {
+                    let username = args.get(1).unwrap().to_string();
+                    client.register(username).await;
+                }
+            },
+            "topic" => {
+                if args.len() > 1 {
+                    let topic = args.get(1).unwrap().to_string();
+                    client.change_topic(topic).await;
+                }
+            },
+            "connect" => {
+                client.connect("/ip4/0.0.0.0/tcp/0".parse().unwrap()).await;
             }
             _ => {}
         }

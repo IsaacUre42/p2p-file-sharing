@@ -1,6 +1,5 @@
 use futures::prelude::*;
-use libp2p::{core::upgrade, gossipsub, gossipsub::{MessageAuthenticity, ValidationMode}, identify, identity, kad, kad::{store::MemoryStore}, mdns, noise, request_response, swarm::{NetworkBehaviour, SwarmEvent}, tcp, yamux, Multiaddr, PeerId,
-             StreamProtocol, Swarm, Transport};
+use libp2p::{core::upgrade, gossipsub, gossipsub::{MessageAuthenticity, ValidationMode}, identify, identity, kad, kad::{store::MemoryStore}, mdns, noise, request_response, swarm::{NetworkBehaviour, SwarmEvent}, tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, Transport, TransportError};
 use std::{
     collections::hash_map::DefaultHasher,
     error::Error,
@@ -9,9 +8,12 @@ use std::{
     task::Poll,
     time::Duration,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::io::stderr;
 use futures::channel::mpsc::{Receiver, Sender};
 use futures::channel::{mpsc, oneshot};
+use libp2p::gossipsub::{Topic, TopicHash};
+use libp2p::kad::Quorum;
 use libp2p::request_response::ResponseChannel;
 use libp2p::swarm::handler::ProtocolSupport;
 use libp2p::swarm::PeerAddresses;
@@ -19,27 +21,85 @@ use libp2p::swarm::SwarmEvent::Behaviour;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+// First, define a custom error type
+#[derive(Debug)]
+struct PeerNotRegisteredError {
+    message: String,
+}
+impl std::fmt::Display for PeerNotRegisteredError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+impl std::error::Error for PeerNotRegisteredError {}
+
 enum Command {
     SendMessage {
         message: String,
-        sender: oneshot::Sender<(), Box<dyn Error + Send>>
+        sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>
+    },
+    Register {
+        user_info: UserInfo,
+        sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>
+    },
+    ChangeTopic {
+        topic: String,
+        sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>
+    },
+    Connect {
+        address: String,
+        sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UserInfo {
+    peer_id: PeerId,
+    username: String
 }
 
 #[derive(Clone)]
 pub struct Client {
     sender: Sender<Command>,
+    peer_id: PeerId,
 }
 
 impl Client {
-    pub async fn send_message(&mut self, message: String) {
+    pub async fn send_message(&mut self, message: String) -> Result<(), Box<dyn Error + Send>>{
         let (sender, receiver) = oneshot::channel();
         self.sender
             .send(Command::SendMessage {message, sender})
             .await
             .expect("Command receiver not to be dropped");
-        receiver.await.expect("Sender not to be dropped");
+        receiver.await.expect("Sender not to be dropped")
+    }
 
+    pub async fn register(&mut self, username: String) -> Result<(), Box<dyn Error + Send>> {
+        let (sender, receiver) = oneshot::channel();
+        let user_info = UserInfo { peer_id: self.peer_id, username };
+        self.sender
+            .send(Command::Register {user_info, sender})
+            .await
+            .expect("Command receiver not to be dropped");
+        receiver.await.expect("Sender not to be dropped")
+    }
+
+    pub async fn change_topic(&mut self, topic: String) -> Result<(), Box<dyn Error + Send>> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(Command::ChangeTopic {topic, sender})
+            .await
+            .expect("Command not to be dropped");
+        receiver.await.expect("Sender not to be dropped")
+    }
+
+    pub async fn connect(&mut self, address: String) -> Result<(), Box<dyn Error + Send>>{
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(Command::Connect {address, sender})
+            .await
+            .expect("Command receiver not to be dropped");
+        receiver.await.expect("Sender not to be dropped")
     }
 }
 
@@ -103,9 +163,11 @@ pub async fn new(secret_key_seed: Option<u8>) -> Result<(Client, impl Stream<Ite
     Ok((
         Client{
             sender: command_sender,
+            peer_id,
+
         },
         event_receiver,
-        EventLoop::new(swarm, command_receiver, event_sender)
+        EventLoop::new(swarm, command_receiver, event_sender, )
         ))
 }
 
@@ -126,7 +188,8 @@ pub struct EventLoop {
     swarm: Swarm<MyBehaviour>,
     command_receiver: Receiver<Command>,
     event_sender: Sender<Event>,
-    topic: gossipsub::IdentTopic
+    topic: gossipsub::IdentTopic,
+    registered_users: HashMap<PeerId, String>,
 }
 
 impl EventLoop {
@@ -135,12 +198,12 @@ impl EventLoop {
             swarm,
             command_receiver,
             event_sender,
-            topic: gossipsub::IdentTopic::new("test-net"),
+            topic: gossipsub::IdentTopic::new("default"),
+            registered_users: HashMap::new(),
         }
     }
 
     pub async fn run(mut self) {
-        self.swarm.behaviour_mut().gossipsub.subscribe(&self.topic).unwrap();
         loop {
             tokio::select! {
                 event = self.swarm.select_next_some() => self.handle_event(event).await,
@@ -157,6 +220,10 @@ impl EventLoop {
             Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                 for (peer_id, _multiaddr) in list {
                     println!("mDNS discovered a new peer: {peer_id}");
+                    if !self.registered_users.contains_key(&peer_id) {
+                        let key = kad::RecordKey::new(&peer_id.to_bytes());
+                        self.swarm.behaviour_mut().kademlia.get_record(key);
+                    }
                     self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                 }
             },
@@ -169,16 +236,22 @@ impl EventLoop {
             Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Message {
                 propagation_source: peer_id,
                 message_id: id,
-                message})) =>  println!(
-                "Got message: '{}' with id: {id} from peer: {peer_id}",
-                String::from_utf8_lossy(&message.data)
-            ),
+                message})) => {
+                if !self.registered_users.contains_key(&peer_id) {
+                    let key = kad::RecordKey::new(&peer_id.to_bytes());
+                    self.swarm.behaviour_mut().kademlia.get_record(key);
+                }
+                println!("Got message: '{}' with id: {id} from peer: {peer_id}",
+                    String::from_utf8_lossy(&message.data));
+            },
             SwarmEvent::NewListenAddr {address, ..} => {
                 println!("Local node is listening on {address}")
             }
             _ => {}
         }
     }
+    
+    
 
     async fn handle_command(&mut self, command: Command) {
         match command {
@@ -186,11 +259,63 @@ impl EventLoop {
                 match self.swarm.behaviour_mut().gossipsub.publish(self.topic.clone(), message.as_bytes()) {
                     Ok(_) => {
                         println!("Sent message: {message}");
-                        sender.send(Ok(()));
+                        sender.send(Ok(())).expect("Sender failed");
                     },
                     Err(e) => {
                         println!("Failed to send message: {e:?}");
-                        sender.send(Err(Box::new(e)));
+                        sender.send(Err(Box::new(e))).expect("Sender failed");
+                    }
+                }
+            },
+            Command::Register {user_info, sender} => {
+                let record = kad::Record {
+                    key: kad::RecordKey::new(&user_info.peer_id.to_bytes()),
+                    value: user_info.username.clone().into_bytes(),
+                    publisher: None,
+                    expires: None
+                };
+                match self.swarm.behaviour_mut().kademlia.put_record(record, Quorum::One) {
+                    Ok(_) => {
+                        println!("Successfully registered as {}", user_info.username.as_str());
+                        self.registered_users.insert(user_info.peer_id, user_info.username);
+                        sender.send(Ok(())).expect("Sender failed");
+                    }
+                    Err(e) => {
+                        println!("Failed to register withe err: {e}");
+                        sender.send(Err(Box::new(e))).expect("Sender failed");
+                    }
+                }
+            },
+            Command::ChangeTopic {topic, sender} => {
+                let topic_hash = gossipsub::IdentTopic::new(topic.clone());
+                match self.swarm.behaviour_mut().gossipsub.subscribe(&topic_hash) {
+                    Ok(_) => {
+                        println!("Subscribed to topic {}", topic);
+                        self.topic = topic_hash;
+                        sender.send(Ok(())).expect("Sender failed");
+                    },
+                    Err(e) => {
+                        println!("Failed to subscribe to topic");
+                        sender.send(Err(Box::new(e))).expect("Sender failed");
+                    }
+                }
+            },
+            Command::Connect {address, sender} => {
+                if !self.registered_users.contains_key(self.swarm.local_peer_id()) {
+                    let error = PeerNotRegisteredError {
+                        message: "User must register first".to_string()
+                    };
+                    sender.send(Err(Box::new(error))).expect("Sender failed");
+                    return;
+                }
+                match self.swarm.listen_on(address.parse().unwrap()) {
+                    Ok(_) => {
+                        println!("Listening on address {}", address);
+                        sender.send(Ok(())).expect("Sender failed");
+                    },
+                    Err(e) => {
+                        println!("Failed to listen on address");
+                        sender.send(Err(Box::new(e))).expect("Sender failed");
                     }
                 }
             }
