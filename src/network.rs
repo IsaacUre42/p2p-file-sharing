@@ -246,6 +246,7 @@ impl EventLoop {
                 }
                 println!("Got message: '{}' with id: {id} from peer: {peer_id}",
                     String::from_utf8_lossy(&message.data));
+                println!("Topic: {}", message.topic);
             },
             Behaviour(MyBehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {result, ..})) => {
                 match result {
@@ -255,7 +256,8 @@ impl EventLoop {
                         match serde_cbor::from_slice::<String>(&value) {
                             Ok(username) => {
                                 let peer_id = PeerId::from_bytes(key.as_ref()).unwrap();
-                                self.registered_users.insert(peer_id, username);
+                                self.registered_users.insert(peer_id, username.clone());
+                                println!("Found username: {}", username);
                             },
                             _ => {}
                         }
@@ -276,8 +278,8 @@ impl EventLoop {
             _ => {}
         }
     }
-    
-    
+
+
 
     async fn handle_command(&mut self, command: Command) {
         match command {
