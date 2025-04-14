@@ -10,10 +10,11 @@ use std::{
 };
 use std::collections::{HashMap, HashSet};
 use std::io::stderr;
+use std::str::from_utf8;
 use futures::channel::mpsc::{Receiver, Sender};
 use futures::channel::{mpsc, oneshot};
 use libp2p::gossipsub::{Topic, TopicHash};
-use libp2p::kad::Quorum;
+use libp2p::kad::{QueryResult, Quorum};
 use libp2p::request_response::ResponseChannel;
 use libp2p::swarm::handler::ProtocolSupport;
 use libp2p::swarm::PeerAddresses;
@@ -240,9 +241,34 @@ impl EventLoop {
                 if !self.registered_users.contains_key(&peer_id) {
                     let key = kad::RecordKey::new(&peer_id.to_bytes());
                     self.swarm.behaviour_mut().kademlia.get_record(key);
+                } else {
+                    println!("User: {}", self.registered_users.get(&peer_id).unwrap())
                 }
                 println!("Got message: '{}' with id: {id} from peer: {peer_id}",
                     String::from_utf8_lossy(&message.data));
+            },
+            Behaviour(MyBehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {result, ..})) => {
+                match result {
+                    QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(kad::PeerRecord {
+                        record: kad::Record {key, value, ..},
+                        .. }))) => {
+                        match serde_cbor::from_slice::<String>(&value) {
+                            Ok(username) => {
+                                let peer_id = PeerId::from_bytes(key.as_ref()).unwrap();
+                                self.registered_users.insert(peer_id, username);
+                            },
+                            _ => {}
+                        }
+                    }
+                    QueryResult::Bootstrap(_) => {}
+                    QueryResult::GetClosestPeers(_) => {}
+                    QueryResult::GetProviders(_) => {}
+                    QueryResult::StartProviding(_) => {}
+                    QueryResult::RepublishProvider(_) => {}
+                    QueryResult::PutRecord(_) => {}
+                    QueryResult::RepublishRecord(_) => {},
+                    _ => {}
+                }
             },
             SwarmEvent::NewListenAddr {address, ..} => {
                 println!("Local node is listening on {address}")
@@ -288,6 +314,7 @@ impl EventLoop {
             },
             Command::ChangeTopic {topic, sender} => {
                 let topic_hash = gossipsub::IdentTopic::new(topic.clone());
+                self.swarm.behaviour_mut().gossipsub.unsubscribe(&self.topic);
                 match self.swarm.behaviour_mut().gossipsub.subscribe(&topic_hash) {
                     Ok(_) => {
                         println!("Subscribed to topic {}", topic);
