@@ -1,28 +1,23 @@
 use futures::prelude::*;
-use libp2p::{core::upgrade, gossipsub, gossipsub::{MessageAuthenticity, ValidationMode}, identify, identity, kad, kad::{store::MemoryStore}, mdns, noise, request_response, swarm::{NetworkBehaviour, SwarmEvent}, tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, Transport, TransportError};
+use libp2p::{gossipsub, gossipsub::{MessageAuthenticity}, identify, identity, kad, 
+             kad::{store::MemoryStore}, mdns, noise, request_response, 
+             swarm::{NetworkBehaviour, SwarmEvent}, tcp, yamux, PeerId, StreamProtocol, Swarm, Transport};
 use std::{
     collections::hash_map::DefaultHasher,
     error::Error,
     hash::{Hash, Hasher},
     io,
-    task::Poll,
     time::Duration,
 };
-use std::collections::{HashMap, HashSet};
-use std::io::stderr;
-use std::str::from_utf8;
+use std::collections::{HashMap};
+use std::time::{SystemTime, UNIX_EPOCH};
 use futures::channel::mpsc::{Receiver, Sender};
 use futures::channel::{mpsc, oneshot};
-use libp2p::gossipsub::{Topic, TopicHash};
 use libp2p::kad::{QueryResult, Quorum};
 use libp2p::request_response::ResponseChannel;
-use libp2p::swarm::handler::ProtocolSupport;
-use libp2p::swarm::PeerAddresses;
 use libp2p::swarm::SwarmEvent::Behaviour;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, BufReader};
 
-// First, define a custom error type
 #[derive(Debug)]
 struct PeerNotRegisteredError {
     message: String,
@@ -32,7 +27,7 @@ impl std::fmt::Display for PeerNotRegisteredError {
         write!(f, "{}", self.message)
     }
 }
-impl std::error::Error for PeerNotRegisteredError {}
+impl Error for PeerNotRegisteredError {}
 
 enum Command {
     SendMessage {
@@ -174,7 +169,14 @@ pub async fn new(secret_key_seed: Option<u8>) -> Result<(Client, impl Stream<Ite
 
 fn message_id_fn(message: &gossipsub::Message) -> gossipsub::MessageId {
     let mut s = DefaultHasher::new();
-    message.data.hash(&mut s);
+    let mut timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        .to_be_bytes()
+        .to_vec();
+    timestamp.append(&mut message.data.clone());
+    timestamp.hash(&mut s);
     gossipsub::MessageId::from(s.finish().to_string())
 }
 
@@ -221,10 +223,6 @@ impl EventLoop {
             Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                 for (peer_id, _multiaddr) in list {
                     println!("mDNS discovered a new peer: {peer_id}");
-                    if !self.registered_users.contains_key(&peer_id) {
-                        let key = kad::RecordKey::new(&peer_id.to_bytes());
-                        self.swarm.behaviour_mut().kademlia.get_record(key);
-                    }
                     self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                 }
             },
@@ -242,25 +240,27 @@ impl EventLoop {
                     let key = kad::RecordKey::new(&peer_id.to_bytes());
                     self.swarm.behaviour_mut().kademlia.get_record(key);
                 } else {
-                    println!("User: {}", self.registered_users.get(&peer_id).unwrap())
+                    let username = self.registered_users.get(&peer_id).unwrap();
+                    println!("{username}: {}",
+                             String::from_utf8_lossy(&message.data));
                 }
-                println!("Got message: '{}' with id: {id} from peer: {peer_id}",
-                    String::from_utf8_lossy(&message.data));
-                println!("Topic: {}", message.topic);
             },
+            
+            // Query result to fetch the username associated with a given peer id.
             Behaviour(MyBehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {result, ..})) => {
                 match result {
                     QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(kad::PeerRecord {
                         record: kad::Record {key, value, ..},
                         .. }))) => {
-                        match serde_cbor::from_slice::<String>(&value) {
-                            Ok(username) => {
-                                let peer_id = PeerId::from_bytes(key.as_ref()).unwrap();
-                                self.registered_users.insert(peer_id, username.clone());
-                                println!("Found username: {}", username);
-                            },
-                            _ => {}
-                        }
+                        let peer_id = PeerId::from_bytes(key.as_ref()).unwrap();
+                        let username = match String::from_utf8(value.clone()) {
+                            Ok(name) => {name}
+                            Err(e) => {
+                                println!("Failed to decode username withe error {e}");
+                                "Default".to_string()
+                            }
+                        };
+                        self.registered_users.insert(peer_id, username);
                     }
                     QueryResult::Bootstrap(_) => {}
                     QueryResult::GetClosestPeers(_) => {}
@@ -284,6 +284,13 @@ impl EventLoop {
     async fn handle_command(&mut self, command: Command) {
         match command {
             Command::SendMessage {message, sender} => {
+                if !self.registered_users.contains_key(self.swarm.local_peer_id()) {
+                    let error = PeerNotRegisteredError {
+                        message: "User must register first".to_string()
+                    };
+                    sender.send(Err(Box::new(error))).expect("Sender failed");
+                    return;
+                }
                 match self.swarm.behaviour_mut().gossipsub.publish(self.topic.clone(), message.as_bytes()) {
                     Ok(_) => {
                         println!("Sent message: {message}");
@@ -330,13 +337,6 @@ impl EventLoop {
                 }
             },
             Command::Connect {address, sender} => {
-                if !self.registered_users.contains_key(self.swarm.local_peer_id()) {
-                    let error = PeerNotRegisteredError {
-                        message: "User must register first".to_string()
-                    };
-                    sender.send(Err(Box::new(error))).expect("Sender failed");
-                    return;
-                }
                 match self.swarm.listen_on(address.parse().unwrap()) {
                     Ok(_) => {
                         println!("Listening on address {}", address);

@@ -44,7 +44,7 @@ async fn main() {
                 }
             },
             "connect" => {
-                client.connect("/ip4/0.0.0.0/tcp/0".parse().unwrap()).await;
+                client.connect("/ip4/10.0.0.32/tcp/0".parse().unwrap()).await;
             }
             _ => {}
         }
