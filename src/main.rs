@@ -1,6 +1,6 @@
 use std::io::{BufReader, Stdin};
 use tokio::io;
-use tokio::io::{AsyncBufReadExt, Lines};
+use tokio::io::{AsyncBufReadExt};
 use tokio::spawn;
 use regex::Regex;
 

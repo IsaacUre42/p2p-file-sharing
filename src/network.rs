@@ -1,7 +1,5 @@
 use futures::prelude::*;
-use libp2p::{gossipsub, gossipsub::{MessageAuthenticity}, identify, identity, kad, 
-             kad::{store::MemoryStore}, mdns, noise, request_response, 
-             swarm::{NetworkBehaviour, SwarmEvent}, tcp, yamux, PeerId, StreamProtocol, Swarm, Transport};
+use libp2p::{gossipsub, gossipsub::{MessageAuthenticity}, identify, identity, kad, kad::{store::MemoryStore}, mdns, noise, request_response, swarm::{NetworkBehaviour, SwarmEvent}, tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, Transport};
 use std::{
     collections::hash_map::DefaultHasher,
     error::Error,
@@ -9,12 +7,13 @@ use std::{
     io,
     time::Duration,
 };
-use std::collections::{HashMap};
+use std::collections::{hash_map, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 use futures::channel::mpsc::{Receiver, Sender};
 use futures::channel::{mpsc, oneshot};
 use libp2p::kad::{QueryResult, Quorum};
-use libp2p::request_response::ResponseChannel;
+use libp2p::multiaddr::Protocol;
+use libp2p::request_response::{Message, ResponseChannel};
 use libp2p::swarm::SwarmEvent::Behaviour;
 use serde::{Deserialize, Serialize};
 
@@ -44,6 +43,23 @@ enum Command {
     },
     Connect {
         address: String,
+        sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>
+    },
+    Dial {
+        peer_id: PeerId,
+        peer_add: Multiaddr,
+        sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>
+    },
+    SendDM {
+        message: String,
+        sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>
+    },
+    RequestFile {
+        filename: String,
+        sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>
+    },
+    AdvertiseFile {
+        filename: String,
         sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>
     }
 }
@@ -138,7 +154,7 @@ pub async fn new(secret_key_seed: Option<u8>) -> Result<(Client, impl Stream<Ite
             identify: identify::Behaviour::new(
                 identify::Config::new("/ipfs/1.0.0".to_string(), key.public()),
             ),
-            file_transfer: request_response::cbor::Behaviour::new(
+            request_response: request_response::cbor::Behaviour::new(
                 [(
                     StreamProtocol::new("/file-exchange/1"),
                     request_response::ProtocolSupport::Full
@@ -183,7 +199,7 @@ fn message_id_fn(message: &gossipsub::Message) -> gossipsub::MessageId {
 pub enum Event {
     InboundRequest {
         request: String,
-        channel: ResponseChannel<FileResponse>
+        channel: ResponseChannel<PrivateResponse>
     }
 }
 
@@ -193,6 +209,8 @@ pub struct EventLoop {
     event_sender: Sender<Event>,
     topic: gossipsub::IdentTopic,
     registered_users: HashMap<PeerId, String>,
+    pending_dial: HashMap<PeerId, oneshot::Sender<Result<(), Box<dyn Error + Send>>>>,
+
 }
 
 impl EventLoop {
@@ -203,6 +221,7 @@ impl EventLoop {
             event_sender,
             topic: gossipsub::IdentTopic::new("default"),
             registered_users: HashMap::new(),
+            pending_dial: Default::default()
         }
     }
 
@@ -274,7 +293,39 @@ impl EventLoop {
             },
             SwarmEvent::NewListenAddr {address, ..} => {
                 println!("Local node is listening on {address}")
+            },
+            Behaviour(MyBehaviourEvent::RequestResponse(
+            request_response::Event::Message {message, ..},
+                      )) => match message {
+                Message::Request { request, channel} => {
+
+                }
+                Message::Response { request_id, response} => {
+
+                }
+            },
+            SwarmEvent::ConnectionEstablished {
+                peer_id, endpoint, ..
+            } => {
+                if endpoint.is_dialer() {
+                    if let Some(sender) = self.pending_dial.remove(&peer_id) {
+                        let _ = sender.send(Ok(()));
+                    }
+                }
+            },
+            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                if let Some(peer_id) = peer_id {
+                    if let Some(sender) = self.pending_dial.remove(&peer_id) {
+                        let _ = sender.send(Err(Box::new(error)));
+                    }
+                }
             }
+            SwarmEvent::IncomingConnectionError { .. } => {}
+            SwarmEvent::Dialing {
+                peer_id: Some(peer_id),
+                ..
+            } => eprintln!("Dialing {peer_id}"),
+            e => panic!("{e:?}"),
             _ => {}
         }
     }
@@ -347,16 +398,43 @@ impl EventLoop {
                         sender.send(Err(Box::new(e))).expect("Sender failed");
                     }
                 }
-            }
+            },
+            Command::Dial {peer_id, peer_add, sender} => {
+                if let hash_map::Entry::Vacant(e) = self.pending_dial.entry(peer_id) {
+                    self.swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .add_address(&peer_id, peer_add.clone());
+                    match self.swarm.dial(peer_add.with(Protocol::P2p(peer_id))) {
+                        Ok(()) => {
+                            e.insert(sender);
+                        }
+                        Err(e) => {
+                            let _ = sender.send(Err(Box::new(e)));
+                        }
+                    }
+                } else {
+                    println!("Already dialing peer");
+                }
+            },
+            Command::SendDM { .. } => {}
+            Command::RequestFile { .. } => {}
+            Command::AdvertiseFile { .. } => {}
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct FileRequest(String);
+struct PrivateRequest {
+    message: String,
+    file_request: String
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct FileResponse(String);
+struct PrivateResponse {
+    message: String,
+    file: Vec<u8>
+}
 
 #[derive(NetworkBehaviour)]
 struct MyBehaviour {
@@ -364,5 +442,5 @@ struct MyBehaviour {
     kademlia: kad::Behaviour<MemoryStore>,
     mdns: mdns::tokio::Behaviour,
     identify: identify::Behaviour,
-    file_transfer: request_response::cbor::Behaviour<FileRequest, FileResponse>
+    request_response: request_response::cbor::Behaviour<PrivateRequest, PrivateResponse>,
 }
