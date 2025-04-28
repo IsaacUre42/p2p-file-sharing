@@ -45,6 +45,12 @@ async fn main() {
             },
             "connect" => {
                 client.connect("/ip4/10.0.0.32/tcp/0".parse().unwrap()).await;
+            },
+            "dial" => {
+                if args.len() > 1 {
+                    let username = args.get(1).unwrap().to_string();
+                    client.dial(username).await;
+                }
             }
             _ => {}
         }

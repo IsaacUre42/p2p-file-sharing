@@ -1,5 +1,5 @@
 use futures::prelude::*;
-use libp2p::{gossipsub, gossipsub::{MessageAuthenticity}, identify, identity, kad, kad::{store::MemoryStore}, mdns, noise, request_response, swarm::{NetworkBehaviour, SwarmEvent}, tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, Transport};
+use libp2p::{gossipsub, gossipsub::{MessageAuthenticity}, identify, identity, kad, kad::{store::MemoryStore}, mdns, noise, request_response, swarm::{NetworkBehaviour, SwarmEvent}, tcp, yamux, PeerId, StreamProtocol, Swarm, Transport};
 use std::{
     collections::hash_map::DefaultHasher,
     error::Error,
@@ -8,14 +8,18 @@ use std::{
     time::Duration,
 };
 use std::collections::{hash_map, HashMap};
+use std::num::{NonZero};
 use std::time::{SystemTime, UNIX_EPOCH};
 use futures::channel::mpsc::{Receiver, Sender};
 use futures::channel::{mpsc, oneshot};
 use libp2p::kad::{QueryResult, Quorum};
 use libp2p::multiaddr::Protocol;
-use libp2p::request_response::{Message, ResponseChannel};
+use libp2p::request_response::{Message, OutboundRequestId, ResponseChannel};
+use libp2p::swarm::PeerAddresses;
 use libp2p::swarm::SwarmEvent::Behaviour;
 use serde::{Deserialize, Serialize};
+
+//TODO Working on dialing, when the client joins it instantly dials the peer lol.
 
 #[derive(Debug)]
 struct PeerNotRegisteredError {
@@ -46,8 +50,7 @@ enum Command {
         sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>
     },
     Dial {
-        peer_id: PeerId,
-        peer_add: Multiaddr,
+        username: String,
         sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>
     },
     SendDM {
@@ -67,7 +70,7 @@ enum Command {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UserInfo {
     peer_id: PeerId,
-    username: String
+    username: String,
 }
 
 #[derive(Clone)]
@@ -88,7 +91,7 @@ impl Client {
 
     pub async fn register(&mut self, username: String) -> Result<(), Box<dyn Error + Send>> {
         let (sender, receiver) = oneshot::channel();
-        let user_info = UserInfo { peer_id: self.peer_id, username };
+        let user_info = UserInfo { peer_id: self.peer_id, username};
         self.sender
             .send(Command::Register {user_info, sender})
             .await
@@ -111,6 +114,15 @@ impl Client {
             .send(Command::Connect {address, sender})
             .await
             .expect("Command receiver not to be dropped");
+        receiver.await.expect("Sender not to be dropped")
+    }
+    
+    pub async fn dial(&mut self, username: String) -> Result<(), Box<dyn Error + Send>>{
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(Command::Dial {username, sender})
+            .await
+            .expect("Command not to be dropped");
         receiver.await.expect("Sender not to be dropped")
     }
 }
@@ -175,8 +187,7 @@ pub async fn new(secret_key_seed: Option<u8>) -> Result<(Client, impl Stream<Ite
     Ok((
         Client{
             sender: command_sender,
-            peer_id,
-
+            peer_id
         },
         event_receiver,
         EventLoop::new(swarm, command_receiver, event_sender, )
@@ -209,8 +220,10 @@ pub struct EventLoop {
     event_sender: Sender<Event>,
     topic: gossipsub::IdentTopic,
     registered_users: HashMap<PeerId, String>,
+    rev_registered_users: HashMap<String, PeerId>,
+    peer_addresses: PeerAddresses,
     pending_dial: HashMap<PeerId, oneshot::Sender<Result<(), Box<dyn Error + Send>>>>,
-
+    pending_request_message: HashMap<OutboundRequestId, oneshot::Sender<Result<String, Box<dyn Error + Send>>>>,
 }
 
 impl EventLoop {
@@ -221,7 +234,10 @@ impl EventLoop {
             event_sender,
             topic: gossipsub::IdentTopic::new("default"),
             registered_users: HashMap::new(),
-            pending_dial: Default::default()
+            rev_registered_users: HashMap::new(),
+            pending_dial: Default::default(),
+            pending_request_message: Default::default(),
+            peer_addresses: PeerAddresses::new(NonZero::new(32usize).unwrap())
         }
     }
 
@@ -240,15 +256,17 @@ impl EventLoop {
     async fn handle_event(&mut self, event: SwarmEvent<MyBehaviourEvent>) {
         match event {
             Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                for (peer_id, _multiaddr) in list {
+                for (peer_id, multiaddr) in list {
                     println!("mDNS discovered a new peer: {peer_id}");
                     self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                    self.peer_addresses.add(peer_id, multiaddr);
                 }
             },
             Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
-                for (peer_id, _multiaddr) in list {
+                for (peer_id, multiaddr) in list {
                     println!("mDNS discover peer has expired: {peer_id}");
                     self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                    self.peer_addresses.remove(&peer_id, &multiaddr);
                 }
             },
             Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Message {
@@ -275,11 +293,12 @@ impl EventLoop {
                         let username = match String::from_utf8(value.clone()) {
                             Ok(name) => {name}
                             Err(e) => {
-                                println!("Failed to decode username withe error {e}");
+                                println!("Failed to decode username with error {e}");
                                 "Default".to_string()
                             }
                         };
-                        self.registered_users.insert(peer_id, username);
+                        self.registered_users.insert(peer_id, username.clone());
+                        self.rev_registered_users.insert(username, peer_id);
                     }
                     QueryResult::Bootstrap(_) => {}
                     QueryResult::GetClosestPeers(_) => {}
@@ -297,11 +316,11 @@ impl EventLoop {
             Behaviour(MyBehaviourEvent::RequestResponse(
             request_response::Event::Message {message, ..},
                       )) => match message {
-                Message::Request { request, channel} => {
-
+                Message::Request { request, channel, .. } => {
+                    self.event_sender.send(Event::InboundRequest {request: request.message, channel}).await.expect("Event receiver not to be dropped");
                 }
                 Message::Response { request_id, response} => {
-
+                    let _ = self.pending_request_message.remove(&request_id).expect("Request to still be pending.").send(Ok(response.message));
                 }
             },
             SwarmEvent::ConnectionEstablished {
@@ -326,7 +345,6 @@ impl EventLoop {
                 ..
             } => eprintln!("Dialing {peer_id}"),
             e => panic!("{e:?}"),
-            _ => {}
         }
     }
 
@@ -363,7 +381,8 @@ impl EventLoop {
                 match self.swarm.behaviour_mut().kademlia.put_record(record, Quorum::One) {
                     Ok(_) => {
                         println!("Successfully registered as {}", user_info.username.as_str());
-                        self.registered_users.insert(user_info.peer_id, user_info.username);
+                        self.registered_users.insert(user_info.peer_id, user_info.username.clone());
+                        self.rev_registered_users.insert(user_info.username, user_info.peer_id);
                         sender.send(Ok(())).expect("Sender failed");
                     }
                     Err(e) => {
@@ -399,13 +418,15 @@ impl EventLoop {
                     }
                 }
             },
-            Command::Dial {peer_id, peer_add, sender} => {
-                if let hash_map::Entry::Vacant(e) = self.pending_dial.entry(peer_id) {
+            Command::Dial {username, sender } => {
+                let peer_id = self.rev_registered_users.get(&username).unwrap();
+                let peer_add = self.peer_addresses.get(peer_id).next().unwrap();
+                if let hash_map::Entry::Vacant(e) = self.pending_dial.entry(*peer_id) {
                     self.swarm
                         .behaviour_mut()
                         .kademlia
                         .add_address(&peer_id, peer_add.clone());
-                    match self.swarm.dial(peer_add.with(Protocol::P2p(peer_id))) {
+                    match self.swarm.dial(peer_add.with(Protocol::P2p(*peer_id))) {
                         Ok(()) => {
                             e.insert(sender);
                         }
