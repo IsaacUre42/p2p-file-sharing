@@ -19,8 +19,6 @@ use libp2p::swarm::PeerAddresses;
 use libp2p::swarm::SwarmEvent::Behaviour;
 use serde::{Deserialize, Serialize};
 
-//TODO Working on dialing, when the client joins it instantly dials the peer lol.
-
 #[derive(Debug)]
 struct PeerNotRegisteredError {
     message: String,
@@ -31,6 +29,8 @@ impl std::fmt::Display for PeerNotRegisteredError {
     }
 }
 impl Error for PeerNotRegisteredError {}
+
+//TODO maybe only register after connecting?
 
 enum Command {
     SendMessage {
@@ -344,7 +344,7 @@ impl EventLoop {
                 peer_id: Some(peer_id),
                 ..
             } => eprintln!("Dialing {peer_id}"),
-            e => panic!("{e:?}"),
+            e => println!("Failed to connect to peer")
         }
     }
 
@@ -419,7 +419,10 @@ impl EventLoop {
                 }
             },
             Command::Dial {username, sender } => {
-                let peer_id = self.rev_registered_users.get(&username).unwrap();
+                let peer_id = match self.rev_registered_users.get(&username) {
+                    None => { println!("Failed to identify peer"); return; }
+                    Some(id) => {id}
+                };
                 let peer_add = self.peer_addresses.get(peer_id).next().unwrap();
                 if let hash_map::Entry::Vacant(e) = self.pending_dial.entry(*peer_id) {
                     self.swarm
