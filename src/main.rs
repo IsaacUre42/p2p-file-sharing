@@ -51,6 +51,13 @@ async fn main() {
                     let username = args.get(1).unwrap().to_string();
                     client.dial(username).await;
                 }
+            },
+            "dm" => {
+                if args.len() > 2 {
+                    let username = args.get(1).unwrap().to_string();
+                    let message = args.get(2).unwrap().to_string();
+                    client.dm(username, message).await;
+                }
             }
             _ => {}
         }

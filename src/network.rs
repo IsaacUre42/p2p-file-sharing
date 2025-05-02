@@ -18,19 +18,18 @@ use libp2p::request_response::{Message, OutboundRequestId, ResponseChannel};
 use libp2p::swarm::PeerAddresses;
 use libp2p::swarm::SwarmEvent::Behaviour;
 use serde::{Deserialize, Serialize};
+use crate::network::RequestType::{MessageText};
 
 #[derive(Debug)]
-struct PeerNotRegisteredError {
+struct CustomError {
     message: String,
 }
-impl std::fmt::Display for PeerNotRegisteredError {
+impl std::fmt::Display for CustomError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.message)
     }
 }
-impl Error for PeerNotRegisteredError {}
-
-//TODO maybe only register after connecting?
+impl Error for CustomError {}
 
 enum Command {
     SendMessage {
@@ -53,13 +52,10 @@ enum Command {
         username: String,
         sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>
     },
-    SendDM {
-        message: String,
-        sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>
-    },
-    RequestFile {
-        filename: String,
-        sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>
+    SendRequest {
+        request: PrivateRequest,
+        username: String,
+        sender: oneshot::Sender<Result<String, Box<dyn Error + Send>>>
     },
     AdvertiseFile {
         filename: String,
@@ -125,6 +121,20 @@ impl Client {
             .expect("Command not to be dropped");
         receiver.await.expect("Sender not to be dropped")
     }
+    
+    pub async fn dm(&mut self, username: String, message: String) -> Result<String, Box<dyn Error + Send>> {
+        let (sender, receiver) = oneshot::channel();
+        let request = PrivateRequest {
+            request_type: MessageText,
+            message,
+            file_request: "".to_string(),
+        };
+        self.sender
+            .send(Command::SendRequest {request, username, sender})
+            .await
+            .expect("Command not to be dropped");
+        receiver.await.expect("Sender not to be dropped")
+    }
 }
 
 pub async fn new(secret_key_seed: Option<u8>) -> Result<(Client, impl Stream<Item = Event>, EventLoop), Box<dyn Error>> {
@@ -177,6 +187,17 @@ pub async fn new(secret_key_seed: Option<u8>) -> Result<(Client, impl Stream<Ite
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
 
+    // Subscribing and picking an address before setting up kademlia works great
+
+    // Create a Gossipsub topic
+    let topic = gossipsub::IdentTopic::new("default");
+    // subscribes to our topic
+    swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
+
+    // Listen on all interfaces and whatever port the OS assigns
+    // swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
+    swarm.listen_on("/ip4/10.0.0.32/tcp/0".parse()?)?;
+
     swarm
         .behaviour_mut()
         .kademlia
@@ -208,8 +229,8 @@ fn message_id_fn(message: &gossipsub::Message) -> gossipsub::MessageId {
 }
 
 pub enum Event {
-    InboundRequest {
-        request: String,
+    InboundFileRequest {
+        request: PrivateRequest,
         channel: ResponseChannel<PrivateResponse>
     }
 }
@@ -224,6 +245,7 @@ pub struct EventLoop {
     peer_addresses: PeerAddresses,
     pending_dial: HashMap<PeerId, oneshot::Sender<Result<(), Box<dyn Error + Send>>>>,
     pending_request_message: HashMap<OutboundRequestId, oneshot::Sender<Result<String, Box<dyn Error + Send>>>>,
+    msg_log: HashMap<PeerId, Vec<String>>
 }
 
 impl EventLoop {
@@ -237,7 +259,8 @@ impl EventLoop {
             rev_registered_users: HashMap::new(),
             pending_dial: Default::default(),
             pending_request_message: Default::default(),
-            peer_addresses: PeerAddresses::new(NonZero::new(32usize).unwrap())
+            peer_addresses: PeerAddresses::new(NonZero::new(32usize).unwrap()),
+            msg_log: Default::default()
         }
     }
 
@@ -276,6 +299,17 @@ impl EventLoop {
                 if !self.registered_users.contains_key(&peer_id) {
                     let key = kad::RecordKey::new(&peer_id.to_bytes());
                     self.swarm.behaviour_mut().kademlia.get_record(key);
+                    match self.msg_log.get_mut(&peer_id) {
+                        None => {
+                            let mut messages: Vec<String> = Vec::new();
+                            let message_str = String::from_utf8_lossy(&message.data).to_string();
+                            messages.push(message_str);
+                            self.msg_log.insert(peer_id, messages);
+                        }
+                        Some(messages) => {
+                            messages.push(String::from_utf8_lossy(&message.data).to_string());
+                        }
+                    }
                 } else {
                     let username = self.registered_users.get(&peer_id).unwrap();
                     println!("{username}: {}",
@@ -298,7 +332,16 @@ impl EventLoop {
                             }
                         };
                         self.registered_users.insert(peer_id, username.clone());
-                        self.rev_registered_users.insert(username, peer_id);
+                        self.rev_registered_users.insert(username.clone(), peer_id);
+                        match self.msg_log.get_mut(&peer_id) {
+                            None => {}
+                            Some(messages) => {
+                                for message in messages {
+                                    println!("[Backlog] {username}: {}", message);
+                                    }
+                                }
+                            }
+                        self.msg_log.remove(&peer_id);
                     }
                     QueryResult::Bootstrap(_) => {}
                     QueryResult::GetClosestPeers(_) => {}
@@ -317,7 +360,27 @@ impl EventLoop {
             request_response::Event::Message {message, ..},
                       )) => match message {
                 Message::Request { request, channel, .. } => {
-                    self.event_sender.send(Event::InboundRequest {request: request.message, channel}).await.expect("Event receiver not to be dropped");
+                    match request.request_type {
+                        RequestType::MessageText => {
+                            println!("Private Message: {}", request.message);
+                            let responder = PrivateResponse {
+                                message: "".to_string(),
+                                file: Vec::new()
+                            };
+                            self
+                                .swarm
+                                .behaviour_mut()
+                                .request_response
+                                .send_response(channel, responder)
+                                .expect("Connection to peer to still be open");
+                        }
+                        RequestType::File => {
+                            self.event_sender.send(Event::InboundFileRequest {
+                                request,
+                                channel
+                            }).await.expect("Event receiver not to be dropped");
+                        }
+                    }
                 }
                 Message::Response { request_id, response} => {
                     let _ = self.pending_request_message.remove(&request_id).expect("Request to still be pending.").send(Ok(response.message));
@@ -344,7 +407,7 @@ impl EventLoop {
                 peer_id: Some(peer_id),
                 ..
             } => eprintln!("Dialing {peer_id}"),
-            e => println!("Failed to connect to peer")
+            _ => {}
         }
     }
 
@@ -354,7 +417,7 @@ impl EventLoop {
         match command {
             Command::SendMessage {message, sender} => {
                 if !self.registered_users.contains_key(self.swarm.local_peer_id()) {
-                    let error = PeerNotRegisteredError {
+                    let error = CustomError {
                         message: "User must register first".to_string()
                     };
                     sender.send(Err(Box::new(error))).expect("Sender failed");
@@ -441,15 +504,39 @@ impl EventLoop {
                     println!("Already dialing peer");
                 }
             },
-            Command::SendDM { .. } => {}
-            Command::RequestFile { .. } => {}
+            Command::SendRequest { request, username, sender } => {
+                let peer = match self.rev_registered_users.get(&username) {
+                    None => { 
+                        println!("Failed to identify peer");
+                        let error = CustomError {
+                            message: "Peer not found".to_string()
+                        };
+                        sender.send(Err(Box::new(error))).expect("Sender failed");
+                        return
+                    }
+                    Some(id) => {id}
+                };
+                let dm_id = self.
+                    swarm.
+                    behaviour_mut().
+                    request_response.
+                    send_request(&peer, request);
+                self.pending_request_message.insert(dm_id, sender);
+            }
             Command::AdvertiseFile { .. } => {}
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+enum RequestType {
+    MessageText,
+    File
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PrivateRequest {
+    request_type: RequestType,
     message: String,
     file_request: String
 }
