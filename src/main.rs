@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::Path;
 use tokio::io;
 use tokio::io::{AsyncBufReadExt};
@@ -60,8 +61,15 @@ async fn main() {
                 }
             },
             "offer" => {
+                // println!("{}", std::env::current_dir().unwrap().to_str().unwrap());
                 if args.len() > 1 {
+                    //TODO Fix bad file exiting loop
                     let filepath = args.get(1).unwrap().to_string();
+                    let file = match fs::read(filepath.clone()) {
+                        Ok(file) => {file}
+                        Err(_) => {println!("Failed to load file"); return}
+                    };
+                    // if file.len() == 0 {println!("Failed to load file"); return}
                     let filename = match Path::new(&filepath).file_name() {
                         None => {println!("Failed to load file"); return}
                         Some(name) => {name.to_str().unwrap()}
