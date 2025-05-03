@@ -1,4 +1,4 @@
-use std::io::{BufReader, Stdin};
+use std::path::Path;
 use tokio::io;
 use tokio::io::{AsyncBufReadExt};
 use tokio::spawn;
@@ -57,6 +57,24 @@ async fn main() {
                     let username = args.get(1).unwrap().to_string();
                     let message = args.get(2).unwrap().to_string();
                     client.dm(username, message).await;
+                }
+            },
+            "offer" => {
+                if args.len() > 1 {
+                    let filepath = args.get(1).unwrap().to_string();
+                    let filename = match Path::new(&filepath).file_name() {
+                        None => {println!("Failed to load file"); return}
+                        Some(name) => {name.to_str().unwrap()}
+                    };
+                    let mut files: Vec<String> = Vec::new();
+                    files.push(filename.to_string());
+                    client.offer_files(files).await;
+                }
+            }
+            "get" => {
+                if args.len() > 1 {
+                    let username = args.get(1).unwrap().to_string();
+                    client.get_offerings(username).await;
                 }
             }
             _ => {}

@@ -9,6 +9,7 @@ use std::{
 };
 use std::collections::{hash_map, HashMap};
 use std::num::{NonZero};
+use std::string::FromUtf8Error;
 use std::time::{SystemTime, UNIX_EPOCH};
 use futures::channel::mpsc::{Receiver, Sender};
 use futures::channel::{mpsc, oneshot};
@@ -57,8 +58,12 @@ enum Command {
         username: String,
         sender: oneshot::Sender<Result<String, Box<dyn Error + Send>>>
     },
-    AdvertiseFile {
-        filename: String,
+    OfferFiles {
+        filenames: Vec<String>,
+        sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>
+    },
+    GetOfferings {
+        username: String,
         sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>
     }
 }
@@ -131,6 +136,24 @@ impl Client {
         };
         self.sender
             .send(Command::SendRequest {request, username, sender})
+            .await
+            .expect("Command not to be dropped");
+        receiver.await.expect("Sender not to be dropped")
+    }
+    
+    pub async fn offer_files(&mut self, filenames: Vec<String>) -> Result<(), Box<dyn Error + Send>> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(Command::OfferFiles {filenames, sender})
+            .await
+            .expect("Command not to be dropped");
+        receiver.await.expect("Sender not to be dropped")
+    }
+    
+    pub async fn get_offerings(&mut self, username: String) -> Result<(), Box<dyn Error + Send>> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(Command::GetOfferings {username, sender})
             .await
             .expect("Command not to be dropped");
         receiver.await.expect("Sender not to be dropped")
@@ -248,6 +271,8 @@ pub struct EventLoop {
     msg_log: HashMap<PeerId, Vec<String>>
 }
 
+const FILES_NAMESPACE: &[u8] = b"/files/";
+
 impl EventLoop {
     fn new(swarm: Swarm<MyBehaviour>, command_receiver: Receiver<Command>, event_sender: Sender<Event>) -> Self {
         Self {
@@ -323,25 +348,52 @@ impl EventLoop {
                     QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(kad::PeerRecord {
                         record: kad::Record {key, value, ..},
                         .. }))) => {
-                        let peer_id = PeerId::from_bytes(key.as_ref()).unwrap();
-                        let username = match String::from_utf8(value.clone()) {
-                            Ok(name) => {name}
-                            Err(e) => {
-                                println!("Failed to decode username with error {e}");
-                                "Default".to_string()
+                        let key_bytes = key.to_vec();
+
+                        if key_bytes.starts_with(FILES_NAMESPACE) {
+                            // Record is a username : list of files.
+                            let username = match String::from_utf8(key_bytes[FILES_NAMESPACE.len()..].to_vec()) {
+                                Ok(name) => {name}
+                                Err(_) => {
+                                    println!("Failed to decoded username");
+                                    return
+                                }
+                            };
+                            match serde_cbor::from_slice::<Vec<String>>(&*value) {
+                                Ok(files) => {
+                                    println!("Files offered by {username}:");
+                                    for file in files {
+                                        println!("{}", file);
+                                    }
+                                }
+                                Err(_) => {
+                                    println!("Failed to decoded files record");
+                                    return
+                                }
                             }
-                        };
-                        self.registered_users.insert(peer_id, username.clone());
-                        self.rev_registered_users.insert(username.clone(), peer_id);
-                        match self.msg_log.get_mut(&peer_id) {
-                            None => {}
-                            Some(messages) => {
-                                for message in messages {
-                                    println!("[Backlog] {username}: {}", message);
+
+                        } else {
+                            // Record is likely a peer_id : username, else error.
+                            let peer_id = PeerId::from_bytes(key.as_ref()).unwrap();
+                            let username = match String::from_utf8(value.clone()) {
+                                Ok(name) => {name}
+                                Err(e) => {
+                                    println!("Failed to decode username with error {e}");
+                                    return
+                                }
+                            };
+                            self.registered_users.insert(peer_id, username.clone());
+                            self.rev_registered_users.insert(username.clone(), peer_id);
+                            match self.msg_log.get_mut(&peer_id) {
+                                None => {}
+                                Some(messages) => {
+                                    for message in messages {
+                                        println!("[Backlog] {username}: {}", message);
                                     }
                                 }
                             }
-                        self.msg_log.remove(&peer_id);
+                            self.msg_log.remove(&peer_id);
+                        }
                     }
                     QueryResult::Bootstrap(_) => {}
                     QueryResult::GetClosestPeers(_) => {}
@@ -523,7 +575,41 @@ impl EventLoop {
                     send_request(&peer, request);
                 self.pending_request_message.insert(dm_id, sender);
             }
-            Command::AdvertiseFile { .. } => {}
+            Command::OfferFiles { filenames, sender } => {
+                let mut record_key = FILES_NAMESPACE.to_vec();
+                let username = self.registered_users.get(self.swarm.local_peer_id()).unwrap();
+                record_key.append(&mut username.clone().into_bytes());
+                let record_value = match serde_cbor::to_vec(&filenames) {
+                    Ok(file_bytes) => {file_bytes}
+                    Err(_) => {
+                        println!("Failed to serialize files");
+                        return
+                    }
+                };
+                let record = kad::Record {
+                    key: kad::RecordKey::new(&record_key),
+                    value: record_value,
+                    publisher: None,
+                    expires: None
+                };
+                match self.swarm.behaviour_mut().kademlia.put_record(record, Quorum::One) {
+                    Ok(_) => {
+                        println!("Successfully offered files");
+                        sender.send(Ok(())).expect("Sender failed");
+                    }
+                    Err(e) => {
+                        println!("Failed to offer files");
+                        sender.send(Err(Box::new(e))).expect("Sender failed");
+                    }
+                }
+            },
+            Command::GetOfferings {username, sender} => {
+                let mut record_key = FILES_NAMESPACE.to_vec();
+                record_key.append(&mut username.clone().into_bytes());
+                let key = kad::RecordKey::new(&record_key);
+                self.swarm.behaviour_mut().kademlia.get_record(key);
+                sender.send(Ok(())).expect("Sender failed");
+            }
         }
     }
 }
