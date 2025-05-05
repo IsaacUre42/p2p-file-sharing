@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
+use std::fs::File;
+use std::io::Write;
 use std::path::Path;
 use tokio::io;
 use tokio::io::{AsyncBufReadExt};
@@ -48,9 +50,9 @@ async fn main() {
                     client.change_topic(topic).await;
                 }
             },
-            "connect" => {
-                client.connect("/ip4/10.0.0.32/tcp/0".parse().unwrap()).await;
-            },
+            // "connect" => {
+            //     client.connect("/ip4/10.0.0.32/tcp/0".parse().unwrap()).await;
+            // },
             "dial" => {
                 if args.len() > 1 {
                     let username = args.get(1).unwrap().to_string();
@@ -91,6 +93,37 @@ async fn main() {
                     let username = args.get(1).unwrap().to_string();
                     client.get_offerings(username).await;
                 }
+            }
+            "trade" => {
+                if args.len() > 3 {
+                    let username = args.get(1).unwrap().to_string();
+                    let my_file = args.get(2).unwrap().to_string();
+                    let their_file = args.get(3).unwrap().to_string();
+                    let response = client.offer_trade(my_file.clone(), their_file, username.clone()).await.unwrap();
+                    if response.accepted {
+                        println!("Trade offer accepted, downloaded file");
+                        let file = response.file;
+                        let filename = response.filename;
+                        let path = network::OUTPUT_PATH.to_owned() + filename.as_str();
+                        match fs::create_dir(network::OUTPUT_PATH) {
+                            Ok(_) => {}
+                            Err(_) => {}
+                        }
+                        let mut location = File::create(path.clone()).unwrap();
+                        location.write_all(&*file).unwrap();
+
+                        client.send_file(username, my_file).await;
+                        println!("Sent return file");
+                    } else {
+                        println!("trade failed.");
+                    }
+                }
+            },
+            "accept" => {
+                client.offer_response(true).await;
+            },
+            "deny" => {
+                client.offer_response(false).await;
             }
             _ => {}
         }

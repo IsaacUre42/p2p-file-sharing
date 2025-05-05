@@ -1,15 +1,9 @@
 use futures::prelude::*;
 use libp2p::{gossipsub, gossipsub::{MessageAuthenticity}, identify, identity, kad, kad::{store::MemoryStore}, mdns, noise, request_response, swarm::{NetworkBehaviour, SwarmEvent}, tcp, yamux, PeerId, StreamProtocol, Swarm, Transport};
-use std::{
-    collections::hash_map::DefaultHasher,
-    error::Error,
-    hash::{Hash, Hasher},
-    io,
-    time::Duration,
-};
+use std::{collections::hash_map::DefaultHasher, error::Error, fs, hash::{Hash, Hasher}, io, time::Duration};
 use std::collections::{hash_map, HashMap};
 use std::num::{NonZero};
-use std::string::FromUtf8Error;
+use std::string::{ToString};
 use std::time::{SystemTime, UNIX_EPOCH};
 use futures::channel::mpsc::{Receiver, Sender};
 use futures::channel::{mpsc, oneshot};
@@ -70,6 +64,11 @@ enum Command {
     TradeResponse {
         response: bool,
         sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>
+    },
+    SendFile {
+        username: String,
+        filename: String,
+        sender: oneshot::Sender<Result<PrivateResponse, Box<dyn Error + Send>>>
     }
 }
 
@@ -198,6 +197,15 @@ impl Client {
             .expect("Command not to be dropped");
         receiver.await.expect("Sender not to be dropped")
     }
+
+    pub async fn send_file(&mut self, username: String, filename: String) -> Result<PrivateResponse, Box<dyn Error + Send>> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(Command::SendFile {username, filename, sender})
+            .await
+            .expect("Command not to be dropped");
+        receiver.await.expect("Sender not to be dropped")
+    }
 }
 
 pub async fn new(secret_key_seed: Option<u8>) -> Result<(Client, EventLoop), Box<dyn Error>> {
@@ -258,7 +266,7 @@ pub async fn new(secret_key_seed: Option<u8>) -> Result<(Client, EventLoop), Box
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
     // Listen on all interfaces and whatever port the OS assigns
-    swarm.listen_on("/ip4/10.0.0.32/tcp/0".parse()?)?;
+    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
 
     swarm
         .behaviour_mut()
@@ -306,10 +314,10 @@ pub struct EventLoop {
     msg_log: HashMap<PeerId, Vec<String>>,
     my_files: HashMap<String, Vec<u8>>,
     awaiting_confirmation: Vec<TradeRequest>,
-    pending_trade_partner: HashMap<OutboundRequestId, String>
 }
 
 const FILES_NAMESPACE: &[u8] = b"/files/";
+pub(crate) const OUTPUT_PATH: &str = "received/";
 
 impl EventLoop {
     fn new(swarm: Swarm<MyBehaviour>, command_receiver: Receiver<Command>) -> Self {
@@ -324,9 +332,7 @@ impl EventLoop {
             peer_addresses: PeerAddresses::new(NonZero::new(32usize).unwrap()),
             msg_log: Default::default(),
             my_files: Default::default(),
-            awaiting_confirmation: Vec::new(),
-            pending_trade_partner: Default::default()
-        }
+            awaiting_confirmation: Vec::new(), }
     }
 
     pub async fn run(mut self) {
@@ -453,7 +459,7 @@ impl EventLoop {
                       )) => match message {
                 Message::Request { request, channel, .. } => {
                     match request.request_type {
-                        RequestResponseType::MessageText => {
+                        MessageText => {
                             println!("Private Message: {}", request.message);
                             let responder = PrivateResponse {
                                 response_type: MessageText,
@@ -469,52 +475,45 @@ impl EventLoop {
                                 .send_response(channel, responder)
                                 .expect("Connection to peer to still be open");
                         }
-                        RequestResponseType::Trade => {
-                            println!("Trade request from ");
+                        Trade => {
+                            println!("Trade request from {}, they offer: {} for {}", request.username, request.trade_request.get(0).unwrap(), request.trade_request.get(1).unwrap());
+                            println!("Type 'accept' or 'deny'");
                             self.awaiting_confirmation.push(TradeRequest {request, channel});
                         }
                         RequestResponseType::File => {
-                            
-                        } // TODO
+                            let file = request.file.clone();
+                            let filename = request.filename.clone();
+                            let path = OUTPUT_PATH.to_owned() + filename.as_str();
+                            match fs::create_dir(OUTPUT_PATH) {
+                                Ok(_) => {}
+                                Err(_) => {}
+                            }
+                            match fs::write(path.clone(), file) {
+                                Ok(_) => {println!("Saved file {} at {}", filename, path)}
+                                Err(e) => {println!("Failed to write file, {}", e)}
+                            }
+
+                            let response = PrivateResponse {
+                                response_type: RequestResponseType::File,
+                                message: "".to_string(),
+                                file: vec![],
+                                filename: "".to_string(),
+                                accepted: false,
+                            };
+                            self.swarm
+                                .behaviour_mut()
+                                .request_response
+                                .send_response(channel, response)
+                                .expect("Connection still to be open");
+                        }
                     }
                 }
                 Message::Response { request_id, response} => {
-                    match response.response_type {
-                        Trade => {
-                            if response.accepted {
-                                // If the trade was accepted then respond with the file
-                                let file_response = self.my_files.get(&response.message).unwrap();
-                                let username = self.pending_trade_partner.remove(&request_id).unwrap();
-                                let (sender, receiver) = oneshot::channel();
-                                let request = PrivateRequest {
-                                    request_type: RequestResponseType::File,
-                                    username: "".to_string(),
-                                    file: (*file_response.clone()).to_owned(),
-                                    message: "".to_string(),
-                                    filename: response.message.clone(),
-                                    trade_request: ["".to_string(), "".to_string()],
-                                };
-                                let command = Command::SendRequest {
-                                    request,
-                                    username,
-                                    sender,
-                                };
-                                let _ = self.handle_command(command);
-                            }
-                            let _ = self
-                                .pending_request
-                                .remove(&request_id)
-                                .expect("Request to still be pending.")
-                                .send(Ok(response));
-                        }
-                        _ => {
-                            let _ = self
-                                .pending_request
-                                .remove(&request_id)
-                                .expect("Request to still be pending.")
-                                .send(Ok(response));
-                        }
-                    }
+                    let _ = self
+                        .pending_request
+                        .remove(&request_id)
+                        .expect("Request to still be pending.")
+                        .send(Ok(response));
                 }
             },
             SwarmEvent::ConnectionEstablished {
@@ -653,10 +652,34 @@ impl EventLoop {
                     request_response.
                     send_request(&peer, request.clone());
                 self.pending_request.insert(request_id.clone(), sender);
-                match request.request_type {
-                    Trade => {self.pending_trade_partner.insert(request_id, username);}
-                    _ => {}
-                }
+            },
+            Command::SendFile {username, filename, sender} => {
+                let peer = match self.rev_registered_users.get(&username) {
+                    None => {
+                        println!("Failed to identify peer");
+                        let error = CustomError {
+                            message: "Peer not found".to_string()
+                        };
+                        sender.send(Err(Box::new(error))).expect("Sender failed");
+                        return
+                    }
+                    Some(id) => {id}
+                };
+                let file = self.my_files.get(&filename).unwrap();
+                let request = PrivateRequest {
+                    request_type: RequestResponseType::File,
+                    file: (*file.clone()).to_owned(),
+                    username,
+                    message: "".to_string(),
+                    filename,
+                    trade_request: ["".to_string(), "".to_string()],
+                };
+                let request_id = self.
+                    swarm.
+                    behaviour_mut().
+                    request_response.
+                    send_request(&peer, request);
+                self.pending_request.insert(request_id.clone(), sender);
             }
             Command::OfferFiles { filenames, sender, files } => {
                 let mut record_key = FILES_NAMESPACE.to_vec();
@@ -756,11 +779,11 @@ struct PrivateRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrivateResponse {
-    response_type: RequestResponseType,
-    message: String,
-    file: Vec<u8>,
-    filename: String,
-    accepted: bool
+    pub(crate) response_type: RequestResponseType,
+    pub message: String,
+    pub file: Vec<u8>,
+    pub filename: String,
+    pub accepted: bool
 }
 
 #[derive(NetworkBehaviour)]
