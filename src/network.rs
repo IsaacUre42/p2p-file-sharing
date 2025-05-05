@@ -1,14 +1,16 @@
 use futures::prelude::*;
-use libp2p::{gossipsub, gossipsub::{MessageAuthenticity}, identify, identity, kad, kad::{store::MemoryStore}, mdns, noise, request_response, swarm::{NetworkBehaviour, SwarmEvent}, tcp, yamux, PeerId, StreamProtocol, Swarm, Transport};
+use libp2p::{gossipsub, gossipsub::{MessageAuthenticity}, identify, identity, kad, kad::{store::MemoryStore}, mdns, noise, rendezvous, request_response, swarm::{NetworkBehaviour, SwarmEvent}, tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, Transport};
 use std::{collections::hash_map::DefaultHasher, error::Error, fs, hash::{Hash, Hasher}, io, time::Duration};
 use std::collections::{hash_map, HashMap};
 use std::num::{NonZero};
+use std::str::FromStr;
 use std::string::{ToString};
 use std::time::{SystemTime, UNIX_EPOCH};
 use futures::channel::mpsc::{Receiver, Sender};
 use futures::channel::{mpsc, oneshot};
 use libp2p::kad::{QueryResult, Quorum};
 use libp2p::multiaddr::Protocol;
+use libp2p::rendezvous::Namespace;
 use libp2p::request_response::{Message, OutboundRequestId, ResponseChannel};
 use libp2p::swarm::PeerAddresses;
 use libp2p::swarm::SwarmEvent::Behaviour;
@@ -25,6 +27,9 @@ impl std::fmt::Display for CustomError {
     }
 }
 impl Error for CustomError {}
+
+const DEFAULT_NAMESPACE: &str = "p2p-file-sharing";
+const SERVER_PEER_ID: &str = "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN";
 
 enum Command {
     SendMessage {
@@ -69,6 +74,10 @@ enum Command {
         username: String,
         filename: String,
         sender: oneshot::Sender<Result<PrivateResponse, Box<dyn Error + Send>>>
+    },
+    ConnectRendezvous {
+        server_address: String,
+        sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>
     }
 }
 
@@ -206,6 +215,15 @@ impl Client {
             .expect("Command not to be dropped");
         receiver.await.expect("Sender not to be dropped")
     }
+
+    pub async fn connect_rendezvous(&mut self, server_address: String) -> Result<(), Box<dyn Error + Send>> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(Command::ConnectRendezvous { server_address, sender })
+            .await
+            .expect("Command receiver not to be dropped");
+        receiver.await.expect("Sender not to be dropped")
+    }
 }
 
 pub async fn new(secret_key_seed: Option<u8>) -> Result<(Client, EventLoop), Box<dyn Error>> {
@@ -254,6 +272,7 @@ pub async fn new(secret_key_seed: Option<u8>) -> Result<(Client, EventLoop), Box
                     )],
                 request_response::Config::default(),
             ),
+            rendezvous: rendezvous::client::Behaviour::new(key.clone()),
         }))?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
@@ -314,6 +333,8 @@ pub struct EventLoop {
     msg_log: HashMap<PeerId, Vec<String>>,
     my_files: HashMap<String, Vec<u8>>,
     awaiting_confirmation: Vec<TradeRequest>,
+    last_discovery: std::time::Instant,
+    rendezvous_server: Option<String>,
 }
 
 const FILES_NAMESPACE: &[u8] = b"/files/";
@@ -332,16 +353,34 @@ impl EventLoop {
             peer_addresses: PeerAddresses::new(NonZero::new(32usize).unwrap()),
             msg_log: Default::default(),
             my_files: Default::default(),
-            awaiting_confirmation: Vec::new(), }
+            awaiting_confirmation: Vec::new(),
+            last_discovery: std::time::Instant::now(),
+            rendezvous_server: None,
+        }
     }
 
     pub async fn run(mut self) {
+        let mut discovery_interval = tokio::time::interval(Duration::from_secs(60)); // Rediscover every 60 seconds
+        
         loop {
             tokio::select! {
                 event = self.swarm.select_next_some() => self.handle_event(event).await,
                 command = self.command_receiver.next() => match command {
                     Some(c) => self.handle_command(c).await,
                     None => return
+                },
+                _ = discovery_interval.tick() => {
+                    // Periodically try to discover peers if we're connected to a rendezvous server
+                    if let Some(server) = &self.rendezvous_server {
+                        if let Ok(addr) = server.parse::<Multiaddr>() {
+                            self.swarm.behaviour_mut().rendezvous.discover(
+                                Some(Namespace::from_static(DEFAULT_NAMESPACE)),
+                                None,
+                                None,
+                                PeerId::from_str(SERVER_PEER_ID).unwrap(),
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -531,12 +570,33 @@ impl EventLoop {
                         let _ = sender.send(Err(Box::new(error)));
                     }
                 }
-            }
-            SwarmEvent::IncomingConnectionError { .. } => {}
-            SwarmEvent::Dialing {
-                peer_id: Some(peer_id),
-                ..
-            } => {},
+            },
+            Behaviour(MyBehaviourEvent::Rendezvous(rendezvous::client::Event::Discovered { registrations, .. })) => {
+                println!("Discovered {} peers via rendezvous", registrations.len());
+                for registration in registrations {
+                    let peer_id = registration.record.peer_id();
+                    println!("Discovered peer: {}", peer_id);
+                    
+                    self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+
+                    if let Some(addr) = registration.record.addresses().first() {
+                        println!("Address: {}", addr);
+                        let _ = self.swarm.dial(addr.clone());
+                        self.peer_addresses.add(peer_id, addr.clone());
+                        
+                        if !self.registered_users.contains_key(&peer_id) {
+                            let key = kad::RecordKey::new(&peer_id.to_bytes());
+                            self.swarm.behaviour_mut().kademlia.get_record(key);
+                        }
+                    }
+                }
+            },
+            Behaviour(MyBehaviourEvent::Rendezvous(rendezvous::client::Event::Registered { ttl, .. })) => {
+                println!("Successfully registered with rendezvous server (TTL: {}s)", ttl);
+            },
+            Behaviour(MyBehaviourEvent::Rendezvous(rendezvous::client::Event::RegisterFailed { error, .. })) => {
+                println!("Failed to register with rendezvous server: {:?}", error);
+            },
             _ => {}
         }
     }
@@ -756,6 +816,50 @@ impl EventLoop {
                 }
                 sender.send(Ok(())).expect("Sender failed");
             },
+
+            // AI help to integrate the rendezvous server
+            Command::ConnectRendezvous { server_address, sender } => {
+                println!("Connecting to rendezvous server at: {}", server_address);
+                match server_address.parse::<Multiaddr>(){
+                    Ok(addr) => {
+                        match self.swarm.dial(addr.clone()) {
+                            Ok(_) => {
+                                println!("Successfully dialed rendezvous server");
+                                match self.swarm.behaviour_mut().rendezvous.register(
+                                    Namespace::from_static(DEFAULT_NAMESPACE),
+                                    PeerId::from_str(SERVER_PEER_ID).unwrap(),
+                                    None // Use default TTL
+                                ) {
+                                    Ok(_) => {
+                                        println!("Registered with rendezvous server");
+                                        self.swarm.behaviour_mut().rendezvous.discover(
+                                            Some(Namespace::from_static(DEFAULT_NAMESPACE)),
+                                            None,
+                                            None,
+                                            PeerId::from_str(SERVER_PEER_ID).unwrap(),
+                                        );
+                                        self.rendezvous_server = Some(server_address.clone());
+                                    },
+                                    Err(e) => {
+                                        println!("Failed to register with rendezvous server: {:?}", e);
+                                        sender.send(Err(Box::new(e))).expect("Sender failed");
+                                    }
+                                }
+                            },
+                            Err(e) => {
+                                println!("Failed to dial rendezvous server: {:?}", e);
+                                sender.send(Err(Box::new(e))).expect("Sender failed");
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        println!("Invalid rendezvous server address: {:?}", e);
+                        sender.send(Err(Box::new(CustomError {
+                            message: format!("Invalid address: {}", e)
+                        }))).expect("Sender failed");
+                    }
+                }
+            },
         }
     }
 }
@@ -793,4 +897,5 @@ struct MyBehaviour {
     mdns: mdns::tokio::Behaviour,
     identify: identify::Behaviour,
     request_response: request_response::cbor::Behaviour<PrivateRequest, PrivateResponse>,
+    rendezvous: rendezvous::client::Behaviour,
 }

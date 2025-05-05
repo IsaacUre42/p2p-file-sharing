@@ -18,7 +18,7 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-// Rendezvous_server code only slightly adapted for this project.
+// Rendezvous server code only slightly adapted for this project.
 // SRC: https://github.com/libp2p/rust-libp2p
 
 use std::{error::Error, time::Duration};
@@ -61,7 +61,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .build();
 
     let _ = swarm.listen_on("/ip4/0.0.0.0/tcp/62649".parse().unwrap());
-    
+
     println!("Rendezvous server running with default namespace: {}", DEFAULT_NAMESPACE);
     println!("Server PeerID: {}", swarm.local_peer_id());
     println!("Listening on: /ip4/0.0.0.0/tcp/62649");
@@ -82,7 +82,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     peer,
                     registration.namespace
                 );
-            }
+            },
+            SwarmEvent::NewListenAddr {listener_id, address} => {
+                println!("Local node is listening on {address}")
+            },
             SwarmEvent::Behaviour(MyBehaviourEvent::Rendezvous(
                                       rendezvous::server::Event::DiscoverServed {
                                           enquirer,

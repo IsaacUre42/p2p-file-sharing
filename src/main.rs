@@ -4,6 +4,7 @@ use std::fs;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
+use std::time::Duration;
 use tokio::io;
 use tokio::io::{AsyncBufReadExt};
 use tokio::spawn;
@@ -20,7 +21,6 @@ async fn main() {
     spawn(network_event_loop.run());
 
     let mut stdin = io::BufReader::new(io::stdin()).lines();
-    let mut registered_name: String;
 
     loop {
         
@@ -125,7 +125,19 @@ async fn main() {
             },
             "deny" => {
                 client.offer_response(false).await;
-            }
+            },
+            "discovery" => {
+                if args.len() > 1 {
+                    let address = args.get(1).unwrap().to_string();
+                    match client.connect_rendezvous(address).await {
+                        Ok(_) => println!("Connected to rendezvous server and discovery initiated"),
+                        Err(e) => println!("Failed to connect to rendezvous server: {:?}", e)
+                    }
+                } else {
+                    println!("Usage: discovery <server_address>");
+                    println!("Example: discovery /ip4/127.0.0.1/tcp/62649");
+                }
+            },
             _ => {}
         }
     }
