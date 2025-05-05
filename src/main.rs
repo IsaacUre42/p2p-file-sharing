@@ -10,6 +10,7 @@ use tokio::spawn;
 use regex::Regex;
 
 mod network;
+mod rendezvous_server;
 
 #[tokio::main]
 async fn main() {
