@@ -4,7 +4,6 @@ use std::fs;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
-use std::time::Duration;
 use tokio::io;
 use tokio::io::{AsyncBufReadExt};
 use tokio::spawn;
@@ -67,18 +66,17 @@ async fn main() {
                     client.dm(username, message).await;
                 }
             },
-            "offer" => {
+            "offer" => 'block: {
                 // println!("{}", std::env::current_dir().unwrap().to_str().unwrap());
                 if args.len() > 1 {
-                    //TODO Fix bad file exiting loop
                     let filepath = args.get(1).unwrap().to_string();
                     let file = match fs::read(filepath.clone()) {
                         Ok(file) => {file}
-                        Err(_) => {println!("Failed to load file"); return}
+                        Err(_) => {println!("Failed to load file"); break 'block}
                     };
                     // if file.len() == 0 {println!("Failed to load file"); return}
                     let filename = match Path::new(&filepath).file_name() {
-                        None => {println!("Failed to load file"); return}
+                        None => {println!("Failed to load file"); break 'block}
                         Some(name) => {name.to_str().unwrap()}
                     };
                     let mut filenames: Vec<String> = Vec::new();

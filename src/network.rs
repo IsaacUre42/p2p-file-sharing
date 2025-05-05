@@ -361,7 +361,7 @@ impl EventLoop {
 
     pub async fn run(mut self) {
         let mut discovery_interval = tokio::time::interval(Duration::from_secs(60)); // Rediscover every 60 seconds
-        
+
         loop {
             tokio::select! {
                 event = self.swarm.select_next_some() => self.handle_event(event).await,
@@ -404,7 +404,7 @@ impl EventLoop {
             },
             Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Message {
                 propagation_source: peer_id,
-                message_id: id,
+                message_id: _id,
                 message})) => {
                 if !self.registered_users.contains_key(&peer_id) {
                     let key = kad::RecordKey::new(&peer_id.to_bytes());
@@ -480,13 +480,6 @@ impl EventLoop {
                             self.msg_log.remove(&peer_id);
                         }
                     }
-                    QueryResult::Bootstrap(_) => {}
-                    QueryResult::GetClosestPeers(_) => {}
-                    QueryResult::GetProviders(_) => {}
-                    QueryResult::StartProviding(_) => {}
-                    QueryResult::RepublishProvider(_) => {}
-                    QueryResult::PutRecord(_) => {}
-                    QueryResult::RepublishRecord(_) => {},
                     _ => {}
                 }
             },
@@ -499,7 +492,7 @@ impl EventLoop {
                 Message::Request { request, channel, .. } => {
                     match request.request_type {
                         MessageText => {
-                            println!("Private Message: {}", request.message);
+                            println!("[Private Message] {}: {}", request.username, request.message);
                             let responder = PrivateResponse {
                                 response_type: MessageText,
                                 message: request.message,
@@ -576,14 +569,14 @@ impl EventLoop {
                 for registration in registrations {
                     let peer_id = registration.record.peer_id();
                     println!("Discovered peer: {}", peer_id);
-                    
+
                     self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
 
                     if let Some(addr) = registration.record.addresses().first() {
                         println!("Address: {}", addr);
                         let _ = self.swarm.dial(addr.clone());
                         self.peer_addresses.add(peer_id, addr.clone());
-                        
+
                         if !self.registered_users.contains_key(&peer_id) {
                             let key = kad::RecordKey::new(&peer_id.to_bytes());
                             self.swarm.behaviour_mut().kademlia.get_record(key);
@@ -596,6 +589,71 @@ impl EventLoop {
             },
             Behaviour(MyBehaviourEvent::Rendezvous(rendezvous::client::Event::RegisterFailed { error, .. })) => {
                 println!("Failed to register with rendezvous server: {:?}", error);
+            },
+            Behaviour(MyBehaviourEvent::Identify(identify::Event::Received {
+                                                     peer_id, _info, ..
+                                                 })) => {
+                println!("Identified peer: {}", peer_id);
+
+                // If this is the rendezvous server and we're not yet registered, register now
+                if let Some(_server_addr) = &self.rendezvous_server {
+                    if peer_id == PeerId::from_str(SERVER_PEER_ID).unwrap() {
+                        println!("Received identify from rendezvous server, attempting to register");
+
+                        // Check if we now have external addresses
+                        let external_addrs = self.swarm.external_addresses().collect::<Vec<_>>();
+                        if !external_addrs.is_empty() {
+                            println!("External addresses discovered: {:?}", external_addrs);
+
+                            match self.swarm.behaviour_mut().rendezvous.register(
+                                Namespace::from_static(DEFAULT_NAMESPACE),
+                                peer_id,
+                                None, // Use default TTL
+                            ) {
+                                Ok(_) => {
+                                    println!("Successfully registered with rendezvous server after identify");
+                                    // Initiate discovery
+                                    self.swarm.behaviour_mut().rendezvous.discover(
+                                        Some(Namespace::from_static(DEFAULT_NAMESPACE)),
+                                        None,
+                                        None,
+                                        peer_id,
+                                    );
+                                },
+                                Err(e) => println!("Failed to register with rendezvous server: {:?}", e),
+                            }
+                        } else {
+                            println!("Still no external addresses available after identify");
+                        }
+                    }
+                }
+            },
+            SwarmEvent::NewExternalAddrCandidate { address, .. } => {
+                println!("Discovered external address: {}", address);
+                self.swarm.add_external_address(address);
+
+                // If we have a rendezvous server connection but aren't registered yet, try to register
+                if let Some(_server_addr) = &self.rendezvous_server {
+                    let server_peer_id = PeerId::from_str(SERVER_PEER_ID).unwrap();
+
+                    match self.swarm.behaviour_mut().rendezvous.register(
+                        Namespace::from_static(DEFAULT_NAMESPACE),
+                        server_peer_id,
+                        None, // Use default TTL
+                    ) {
+                        Ok(_) => {
+                            println!("Successfully registered with rendezvous server after external address discovery");
+                            // Initiate discovery
+                            self.swarm.behaviour_mut().rendezvous.discover(
+                                Some(Namespace::from_static(DEFAULT_NAMESPACE)),
+                                None,
+                                None,
+                                server_peer_id,
+                            );
+                        },
+                        Err(e) => println!("Failed to register with rendezvous server: {:?}", e),
+                    }
+                }
             },
             _ => {}
         }
@@ -825,25 +883,43 @@ impl EventLoop {
                         match self.swarm.dial(addr.clone()) {
                             Ok(_) => {
                                 println!("Successfully dialed rendezvous server");
-                                match self.swarm.behaviour_mut().rendezvous.register(
-                                    Namespace::from_static(DEFAULT_NAMESPACE),
-                                    PeerId::from_str(SERVER_PEER_ID).unwrap(),
-                                    None // Use default TTL
-                                ) {
-                                    Ok(_) => {
-                                        println!("Registered with rendezvous server");
-                                        self.swarm.behaviour_mut().rendezvous.discover(
-                                            Some(Namespace::from_static(DEFAULT_NAMESPACE)),
-                                            None,
-                                            None,
-                                            PeerId::from_str(SERVER_PEER_ID).unwrap(),
-                                        );
-                                        self.rendezvous_server = Some(server_address.clone());
-                                    },
-                                    Err(e) => {
-                                        println!("Failed to register with rendezvous server: {:?}", e);
-                                        sender.send(Err(Box::new(e))).expect("Sender failed");
+
+                                // Store the server address for later use
+                                self.rendezvous_server = Some(server_address.clone());
+
+                                // We'll wait for the identify protocol to discover our external addresses
+                                // before attempting to register with the rendezvous server
+
+                                // Check if we already have external addresses
+                                let has_external_addresses = !self.swarm.external_addresses().collect::<Vec<_>>().is_empty();
+
+                                if has_external_addresses {
+                                    // We already have external addresses, so we can register immediately
+                                    match self.swarm.behaviour_mut().rendezvous.register(
+                                        Namespace::from_static(DEFAULT_NAMESPACE),
+                                        PeerId::from_str(SERVER_PEER_ID).unwrap(),
+                                        None // Use default TTL
+                                    ) {
+                                        Ok(_) => {
+                                            println!("Registered with rendezvous server");
+                                            self.swarm.behaviour_mut().rendezvous.discover(
+                                                Some(Namespace::from_static(DEFAULT_NAMESPACE)),
+                                                None,
+                                                None,
+                                                PeerId::from_str(SERVER_PEER_ID).unwrap(),
+                                            );
+                                            sender.send(Ok(())).expect("Sender failed");
+                                        },
+                                        Err(e) => {
+                                            println!("Failed to register with rendezvous server: {:?}", e);
+                                            sender.send(Err(Box::new(e))).expect("Sender failed");
+                                        }
                                     }
+                                } else {
+                                    // No external addresses yet, we'll defer the registration
+                                    // The registration will be triggered by the Identify event
+                                    println!("Waiting for external address discovery before registering...");
+                                    sender.send(Ok(())).expect("Sender failed");
                                 }
                             },
                             Err(e) => {
