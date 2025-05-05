@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::error::Error;
 use std::fs;
 use std::path::Path;
 use tokio::io;
@@ -9,12 +11,13 @@ mod network;
 
 #[tokio::main]
 async fn main() {
-    let (mut client, mut network_events, network_event_loop) =
+    let (mut client, network_event_loop) =
     network::new(None).await.unwrap();
 
     spawn(network_event_loop.run());
 
     let mut stdin = io::BufReader::new(io::stdin()).lines();
+    let mut registered_name: String;
 
     loop {
         
@@ -36,6 +39,7 @@ async fn main() {
                 if args.len() > 1 {
                     let username = args.get(1).unwrap().to_string();
                     client.register(username).await;
+                    
                 }
             },
             "topic" => {
@@ -74,9 +78,12 @@ async fn main() {
                         None => {println!("Failed to load file"); return}
                         Some(name) => {name.to_str().unwrap()}
                     };
-                    let mut files: Vec<String> = Vec::new();
-                    files.push(filename.to_string());
-                    client.offer_files(files).await;
+                    let mut filenames: Vec<String> = Vec::new();
+                    filenames.push(filename.to_string());
+                    
+                    let mut files: HashMap<String, Vec<u8>> = HashMap::new();
+                    files.insert(filename.to_string(), file);
+                    client.offer_files(filenames, files).await;
                 }
             }
             "get" => {

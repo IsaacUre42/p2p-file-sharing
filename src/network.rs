@@ -19,7 +19,7 @@ use libp2p::request_response::{Message, OutboundRequestId, ResponseChannel};
 use libp2p::swarm::PeerAddresses;
 use libp2p::swarm::SwarmEvent::Behaviour;
 use serde::{Deserialize, Serialize};
-use crate::network::RequestType::{MessageText};
+use crate::network::RequestResponseType::{MessageText, Trade};
 
 #[derive(Debug)]
 struct CustomError {
@@ -39,7 +39,7 @@ enum Command {
     },
     Register {
         user_info: UserInfo,
-        sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>
+        sender: oneshot::Sender<Result<String, Box<dyn Error + Send>>>
     },
     ChangeTopic {
         topic: String,
@@ -56,14 +56,19 @@ enum Command {
     SendRequest {
         request: PrivateRequest,
         username: String,
-        sender: oneshot::Sender<Result<String, Box<dyn Error + Send>>>
+        sender: oneshot::Sender<Result<PrivateResponse, Box<dyn Error + Send>>>
     },
     OfferFiles {
         filenames: Vec<String>,
+        files: HashMap<String, Vec<u8>>,
         sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>
     },
     GetOfferings {
         username: String,
+        sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>
+    },
+    TradeResponse {
+        response: bool,
         sender: oneshot::Sender<Result<(), Box<dyn Error + Send>>>
     }
 }
@@ -78,6 +83,7 @@ struct UserInfo {
 pub struct Client {
     sender: Sender<Command>,
     peer_id: PeerId,
+    name: String
 }
 
 impl Client {
@@ -90,14 +96,19 @@ impl Client {
         receiver.await.expect("Sender not to be dropped")
     }
 
-    pub async fn register(&mut self, username: String) -> Result<(), Box<dyn Error + Send>> {
+    pub async fn register(&mut self, username: String) -> Result<String, Box<dyn Error + Send>> {
         let (sender, receiver) = oneshot::channel();
         let user_info = UserInfo { peer_id: self.peer_id, username};
         self.sender
             .send(Command::Register {user_info, sender})
             .await
             .expect("Command receiver not to be dropped");
-        receiver.await.expect("Sender not to be dropped")
+        let received  = receiver.await.expect("Sender not to be dropped");
+        match received {
+            Ok(ref name) => {self.name = name.to_string()}
+            Err(_) => {}
+        }
+        received
     }
 
     pub async fn change_topic(&mut self, topic: String) -> Result<(), Box<dyn Error + Send>> {
@@ -127,12 +138,15 @@ impl Client {
         receiver.await.expect("Sender not to be dropped")
     }
     
-    pub async fn dm(&mut self, username: String, message: String) -> Result<String, Box<dyn Error + Send>> {
+    pub async fn dm(&mut self, username: String, message: String) -> Result<PrivateResponse, Box<dyn Error + Send>> {
         let (sender, receiver) = oneshot::channel();
         let request = PrivateRequest {
             request_type: MessageText,
+            username: self.name.clone(),
+            file: vec![],
             message,
-            file_request: "".to_string(),
+            filename: "".to_string(),
+            trade_request: ["".to_string(), "".to_string()]
         };
         self.sender
             .send(Command::SendRequest {request, username, sender})
@@ -141,10 +155,10 @@ impl Client {
         receiver.await.expect("Sender not to be dropped")
     }
     
-    pub async fn offer_files(&mut self, filenames: Vec<String>) -> Result<(), Box<dyn Error + Send>> {
+    pub async fn offer_files(&mut self, filenames: Vec<String>, files: HashMap<String, Vec<u8>>) -> Result<(), Box<dyn Error + Send>> {
         let (sender, receiver) = oneshot::channel();
         self.sender
-            .send(Command::OfferFiles {filenames, sender})
+            .send(Command::OfferFiles {filenames, sender, files})
             .await
             .expect("Command not to be dropped");
         receiver.await.expect("Sender not to be dropped")
@@ -153,14 +167,40 @@ impl Client {
     pub async fn get_offerings(&mut self, username: String) -> Result<(), Box<dyn Error + Send>> {
         let (sender, receiver) = oneshot::channel();
         self.sender
-            .send(Command::GetOfferings {username, sender})
+            .send(Command::GetOfferings { username, sender })
+            .await
+            .expect("Command not to be dropped");
+        receiver.await.expect("Sender not to be dropped")
+    }
+
+    pub async fn offer_trade(&mut self, my_file: String, their_file: String, username: String) -> Result<PrivateResponse, Box<dyn Error + Send>> {
+        let (sender, receiver) = oneshot::channel();
+        let request = PrivateRequest {
+            request_type: RequestResponseType::Trade,
+            username: self.name.clone(),
+            file: vec![],
+            message: "".to_string(),
+            filename: "".to_string(),
+            trade_request: [my_file, their_file]
+        };
+        self.sender
+            .send(Command::SendRequest {request, username, sender})
+            .await
+            .expect("Command not to be dropped");
+        receiver.await.expect("Sender not to be dropped")
+    }
+    
+    pub async fn offer_response(&mut self, response: bool) -> Result<(), Box<dyn Error + Send>> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(Command::TradeResponse {response, sender})
             .await
             .expect("Command not to be dropped");
         receiver.await.expect("Sender not to be dropped")
     }
 }
 
-pub async fn new(secret_key_seed: Option<u8>) -> Result<(Client, impl Stream<Item = Event>, EventLoop), Box<dyn Error>> {
+pub async fn new(secret_key_seed: Option<u8>) -> Result<(Client, EventLoop), Box<dyn Error>> {
     let id_keys = match secret_key_seed {
         Some(seed) => {
             let mut bytes = [0u8; 32];
@@ -218,7 +258,6 @@ pub async fn new(secret_key_seed: Option<u8>) -> Result<(Client, impl Stream<Ite
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
     // Listen on all interfaces and whatever port the OS assigns
-    // swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
     swarm.listen_on("/ip4/10.0.0.32/tcp/0".parse()?)?;
 
     swarm
@@ -226,15 +265,14 @@ pub async fn new(secret_key_seed: Option<u8>) -> Result<(Client, impl Stream<Ite
         .kademlia
         .set_mode(Some(kad::Mode::Server));
     let (command_sender, command_receiver) = mpsc::channel(0);
-    let (event_sender, event_receiver) = mpsc::channel(0);
 
     Ok((
         Client{
             sender: command_sender,
-            peer_id
+            peer_id,
+            name: "".to_string()
         },
-        event_receiver,
-        EventLoop::new(swarm, command_receiver, event_sender, )
+        EventLoop::new(swarm, command_receiver, )
         ))
 }
 
@@ -251,41 +289,43 @@ fn message_id_fn(message: &gossipsub::Message) -> gossipsub::MessageId {
     gossipsub::MessageId::from(s.finish().to_string())
 }
 
-pub enum Event {
-    InboundFileRequest {
+struct TradeRequest {
         request: PrivateRequest,
         channel: ResponseChannel<PrivateResponse>
-    }
 }
 
 pub struct EventLoop {
     swarm: Swarm<MyBehaviour>,
     command_receiver: Receiver<Command>,
-    event_sender: Sender<Event>,
     topic: gossipsub::IdentTopic,
     registered_users: HashMap<PeerId, String>,
     rev_registered_users: HashMap<String, PeerId>,
     peer_addresses: PeerAddresses,
     pending_dial: HashMap<PeerId, oneshot::Sender<Result<(), Box<dyn Error + Send>>>>,
-    pending_request_message: HashMap<OutboundRequestId, oneshot::Sender<Result<String, Box<dyn Error + Send>>>>,
-    msg_log: HashMap<PeerId, Vec<String>>
+    pending_request: HashMap<OutboundRequestId, oneshot::Sender<Result<PrivateResponse, Box<dyn Error + Send>>>>,
+    msg_log: HashMap<PeerId, Vec<String>>,
+    my_files: HashMap<String, Vec<u8>>,
+    awaiting_confirmation: Vec<TradeRequest>,
+    pending_trade_partner: HashMap<OutboundRequestId, String>
 }
 
 const FILES_NAMESPACE: &[u8] = b"/files/";
 
 impl EventLoop {
-    fn new(swarm: Swarm<MyBehaviour>, command_receiver: Receiver<Command>, event_sender: Sender<Event>) -> Self {
+    fn new(swarm: Swarm<MyBehaviour>, command_receiver: Receiver<Command>) -> Self {
         Self {
             swarm,
             command_receiver,
-            event_sender,
             topic: gossipsub::IdentTopic::new("default"),
             registered_users: HashMap::new(),
             rev_registered_users: HashMap::new(),
             pending_dial: Default::default(),
-            pending_request_message: Default::default(),
+            pending_request: Default::default(),
             peer_addresses: PeerAddresses::new(NonZero::new(32usize).unwrap()),
-            msg_log: Default::default()
+            msg_log: Default::default(),
+            my_files: Default::default(),
+            awaiting_confirmation: Vec::new(),
+            pending_trade_partner: Default::default()
         }
     }
 
@@ -413,11 +453,14 @@ impl EventLoop {
                       )) => match message {
                 Message::Request { request, channel, .. } => {
                     match request.request_type {
-                        RequestType::MessageText => {
+                        RequestResponseType::MessageText => {
                             println!("Private Message: {}", request.message);
                             let responder = PrivateResponse {
-                                message: "".to_string(),
-                                file: Vec::new()
+                                response_type: MessageText,
+                                message: request.message,
+                                file: Vec::new(),
+                                filename: "".to_string(),
+                                accepted: false
                             };
                             self
                                 .swarm
@@ -426,16 +469,52 @@ impl EventLoop {
                                 .send_response(channel, responder)
                                 .expect("Connection to peer to still be open");
                         }
-                        RequestType::File => {
-                            self.event_sender.send(Event::InboundFileRequest {
-                                request,
-                                channel
-                            }).await.expect("Event receiver not to be dropped");
+                        RequestResponseType::Trade => {
+                            println!("Trade request from ");
+                            self.awaiting_confirmation.push(TradeRequest {request, channel});
                         }
+                        RequestResponseType::File => {
+                            
+                        } // TODO
                     }
                 }
                 Message::Response { request_id, response} => {
-                    let _ = self.pending_request_message.remove(&request_id).expect("Request to still be pending.").send(Ok(response.message));
+                    match response.response_type {
+                        Trade => {
+                            if response.accepted {
+                                // If the trade was accepted then respond with the file
+                                let file_response = self.my_files.get(&response.message).unwrap();
+                                let username = self.pending_trade_partner.remove(&request_id).unwrap();
+                                let (sender, receiver) = oneshot::channel();
+                                let request = PrivateRequest {
+                                    request_type: RequestResponseType::File,
+                                    username: "".to_string(),
+                                    file: (*file_response.clone()).to_owned(),
+                                    message: "".to_string(),
+                                    filename: response.message.clone(),
+                                    trade_request: ["".to_string(), "".to_string()],
+                                };
+                                let command = Command::SendRequest {
+                                    request,
+                                    username,
+                                    sender,
+                                };
+                                let _ = self.handle_command(command);
+                            }
+                            let _ = self
+                                .pending_request
+                                .remove(&request_id)
+                                .expect("Request to still be pending.")
+                                .send(Ok(response));
+                        }
+                        _ => {
+                            let _ = self
+                                .pending_request
+                                .remove(&request_id)
+                                .expect("Request to still be pending.")
+                                .send(Ok(response));
+                        }
+                    }
                 }
             },
             SwarmEvent::ConnectionEstablished {
@@ -458,7 +537,7 @@ impl EventLoop {
             SwarmEvent::Dialing {
                 peer_id: Some(peer_id),
                 ..
-            } => eprintln!("Dialing {peer_id}"),
+            } => {},
             _ => {}
         }
     }
@@ -497,8 +576,8 @@ impl EventLoop {
                     Ok(_) => {
                         println!("Successfully registered as {}", user_info.username.as_str());
                         self.registered_users.insert(user_info.peer_id, user_info.username.clone());
-                        self.rev_registered_users.insert(user_info.username, user_info.peer_id);
-                        sender.send(Ok(())).expect("Sender failed");
+                        self.rev_registered_users.insert(user_info.username.clone(), user_info.peer_id);
+                        sender.send(Ok(user_info.username)).expect("Sender failed");
                     }
                     Err(e) => {
                         println!("Failed to register withe err: {e}");
@@ -568,14 +647,18 @@ impl EventLoop {
                     }
                     Some(id) => {id}
                 };
-                let dm_id = self.
+                let request_id = self.
                     swarm.
                     behaviour_mut().
                     request_response.
-                    send_request(&peer, request);
-                self.pending_request_message.insert(dm_id, sender);
+                    send_request(&peer, request.clone());
+                self.pending_request.insert(request_id.clone(), sender);
+                match request.request_type {
+                    Trade => {self.pending_trade_partner.insert(request_id, username);}
+                    _ => {}
+                }
             }
-            Command::OfferFiles { filenames, sender } => {
+            Command::OfferFiles { filenames, sender, files } => {
                 let mut record_key = FILES_NAMESPACE.to_vec();
                 let username = self.registered_users.get(self.swarm.local_peer_id()).unwrap();
                 record_key.append(&mut username.clone().into_bytes());
@@ -595,6 +678,7 @@ impl EventLoop {
                 match self.swarm.behaviour_mut().kademlia.put_record(record, Quorum::One) {
                     Ok(_) => {
                         println!("Successfully offered files");
+                        self.my_files = files;
                         sender.send(Ok(())).expect("Sender failed");
                     }
                     Err(e) => {
@@ -609,28 +693,74 @@ impl EventLoop {
                 let key = kad::RecordKey::new(&record_key);
                 self.swarm.behaviour_mut().kademlia.get_record(key);
                 sender.send(Ok(())).expect("Sender failed");
-            }
+            },
+            Command::TradeResponse {response, sender} => {
+                let trade_request = self.awaiting_confirmation.pop().unwrap();
+                match response {
+                    true => {
+                        let filename = trade_request.request.trade_request.get(1).unwrap();
+                        let offered_file = trade_request.request.trade_request.get(0).unwrap();
+                        let file = self.my_files.get(filename).unwrap();
+                        let response = PrivateResponse {
+                            response_type: Trade,
+                            message: offered_file.to_string(),
+                            file: (*file.clone()).to_owned(),
+                            filename: filename.clone(),
+                            accepted: true,
+                        };
+                        println!("Trade accepted, sending file {}", filename);
+                        self.swarm
+                            .behaviour_mut()
+                            .request_response
+                            .send_response(trade_request.channel, response)
+                            .expect("Channel still to be open");
+                    }
+                    false => {
+                        let response = PrivateResponse {
+                            response_type: Trade,
+                            message: "".to_string(),
+                            file: vec![],
+                            filename: "".to_string(),
+                            accepted: false,
+                        };
+                        self.swarm
+                            .behaviour_mut()
+                            .request_response
+                            .send_response(trade_request.channel, response)
+                            .expect("Channel still to be open");
+                        println!("Trade request has been rejected");
+                    },
+                }
+                sender.send(Ok(())).expect("Sender failed");
+            },
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-enum RequestType {
+enum RequestResponseType {
     MessageText,
-    File
+    File,
+    Trade
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PrivateRequest {
-    request_type: RequestType,
+    request_type: RequestResponseType,
+    file: Vec<u8>,
+    username: String,
     message: String,
-    file_request: String
+    filename: String,
+    trade_request: [String; 2]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct PrivateResponse {
+pub struct PrivateResponse {
+    response_type: RequestResponseType,
     message: String,
-    file: Vec<u8>
+    file: Vec<u8>,
+    filename: String,
+    accepted: bool
 }
 
 #[derive(NetworkBehaviour)]
