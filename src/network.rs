@@ -591,7 +591,7 @@ impl EventLoop {
                 println!("Failed to register with rendezvous server: {:?}", error);
             },
             Behaviour(MyBehaviourEvent::Identify(identify::Event::Received {
-                                                     peer_id, info, ..
+                                                     peer_id, ..
                                                  })) => {
                 println!("Identified peer: {}", peer_id);
 
